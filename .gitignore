@@ -4,3 +4,4 @@ __pycache__/
 .uv-tmp/
 runtime-cache/
 *.pyc
+assimilate_rest_api.yaml
