@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+.uv-cache/
+.uv-tmp/
+runtime-cache/
+*.pyc

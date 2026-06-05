@@ -1,0 +1,993 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "requests>=2.31.0",
+#     "imageio",
+#     "pillow>=10.2.0",
+#     "tqdm>=4.66.0",
+#     "torch>=2.2.0",
+#     "torchvision>=0.17.0",
+#     "matanyone2 @ git+https://github.com/osmaras/MatAnyone2.git",
+#     "assimilate_client @ git+https://github.com/Assimilate-Inc/Assimilate-REST.git",
+# ]
+# ///
+
+import argparse
+import contextlib
+import os
+import time
+import torch
+import shutil
+import requests
+from PIL import Image
+from tqdm.auto import tqdm
+
+# Official Assimilate V2 API bindings
+from assimilate_client import Configuration, ApiClient, DeleteMediaData, ShotData
+from assimilate_client.api import SystemApi, ProjectsApi, ApplicationApi
+from assimilate_client.rest import ApiException
+from matanyone2 import MatAnyone2, InferenceCore
+
+# Configuration Constants
+SCRATCH_HOST = os.environ.get("SCRATCH_HOST", "http://127.0.0.1:8080")
+BASE_CACHE_DIR = os.environ.get("MATANYONE_CACHE", "C:/MatAnyone_Scratch_Cache")
+
+
+def _print_step(message):
+    print(f"[MatAnyone Bridge] {message}")
+
+
+def build_argument_parser():
+    parser = argparse.ArgumentParser(
+        description="Run the MatAnyone bridge against the active or specified SCRATCH shot."
+    )
+    parser.add_argument("-project", help="SCRATCH project identifier", default=None)
+    parser.add_argument("-group", help="SCRATCH group UUID or name", default=None)
+    parser.add_argument("-construct", help="SCRATCH construct UUID", default=None)
+    parser.add_argument("-shot", help="SCRATCH shot UUID", default=None)
+    parser.add_argument(
+        "--scratch-host",
+        default=SCRATCH_HOST,
+        help=f"SCRATCH REST host base URL (default: {SCRATCH_HOST})",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default=BASE_CACHE_DIR,
+        help=f"Local cache directory for rendered frames (default: {BASE_CACHE_DIR})",
+    )
+    parser.add_argument(
+        "--mask-layer-name",
+        default="matte,MatAnyone_Mask",
+        help="Preferred mask layer names (comma-separated).",
+    )
+    parser.add_argument(
+        "--mask-layer-fallback",
+        choices=["strict", "first", "top-visible", "top"],
+        default="first",
+        help="Fallback if named mask layer is not found.",
+    )
+    parser.add_argument(
+        "--max-min-side",
+        type=int,
+        default=1080,
+        help="Resize only if min(width,height) exceeds this value. Aspect ratio is preserved.",
+    )
+    parser.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=4,
+        help="Frame overlap between VRAM batches.",
+    )
+    parser.add_argument(
+        "--import-mode",
+        choices=["api-only", "api-fallback", "manual"],
+        default="api-fallback",
+        help="How to load generated matte back into SCRATCH.",
+    )
+    parser.add_argument(
+        "--note-status",
+        type=int,
+        default=2,
+        help="Status integer used when writing the shot note.",
+    )
+    parser.add_argument(
+        "--keep-temp",
+        action="store_true",
+        help="Keep temporary render and batch folders for debugging.",
+    )
+    parser.add_argument(
+        "--require-cuda",
+        action="store_true",
+        help="Fail if CUDA GPU inference is not available.",
+    )
+    return parser
+
+
+def _safe_attr(value, attr_name, default=None):
+    return getattr(value, attr_name, default) if value is not None else default
+
+
+def _extract_selected_entries(selected_data):
+    if selected_data is None:
+        return []
+
+    for attr in ("selection", "selected_shots", "shots"):
+        value = _safe_attr(selected_data, attr, None)
+        if isinstance(value, list) and value:
+            return value
+    return []
+
+
+def resolve_target_shot(projects_api, app_api, args):
+    if args.project:
+        _print_step(f"Entering project context: {args.project}")
+        app_api.do_application_project_enter(args.project)
+
+    if args.construct:
+        _print_step(f"Entering construct context: {args.construct}")
+        app_api.do_application_player_enter_timeline(args.construct)
+
+    if args.group:
+        _print_step(f"Group argument received but not applied by bridge API: {args.group}")
+
+    if args.shot:
+        shot = projects_api.get_shot(shot_uuid=args.shot)
+        _print_step(f"Targeted explicit shot UUID: {shot.uuid}")
+        return shot
+
+    try:
+        selected = projects_api.get_construct_current_selected_shots(level="ALL")
+        selections = _extract_selected_entries(selected)
+        if selections:
+            first = selections[0]
+            selected_shot = _safe_attr(first, "shot", None)
+            selected_uuid = _safe_attr(selected_shot, "uuid", None) or _safe_attr(first, "uuid", None)
+            if selected_uuid:
+                shot = projects_api.get_shot(shot_uuid=selected_uuid)
+                _print_step(f"Targeted selected shot UUID from construct selection: {shot.uuid}")
+                return shot
+    except Exception as error:
+        _print_step(f"Selection query unavailable, falling back to slot/version: {error}")
+
+    shot = projects_api.get_construct_current_slot_version(slot_idx=0, version_idx=0)
+    _print_step(f"Targeted fallback shot UUID from slot/version 0/0: {shot.uuid}")
+    return shot
+
+
+def parse_version_tuple(version_text):
+    parts = []
+    for token in str(version_text).split("."):
+        digits = "".join(ch for ch in token if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts[:3] + [0] * max(0, 3 - len(parts)))
+
+
+def log_version_support(server_version):
+    current = parse_version_tuple(server_version)
+    documented = (1, 0, 5)
+    if current < documented:
+        _print_step(
+            "Warning: server REST version is older than currently published client docs "
+            f"({server_version} < 1.0.5). Documented output APIs will be tried first, "
+            "but media import and output field behavior may differ on this build."
+        )
+
+
+def extract_output_nodes(outputs_data):
+    if not outputs_data:
+        return []
+
+    for attr in ("outputs", "shots"):
+        value = getattr(outputs_data, attr, None)
+        if value:
+            return list(value)
+
+    if isinstance(outputs_data, list):
+        return outputs_data
+
+    return []
+
+
+def ensure_current_output(projects_api):
+    outputs_data = projects_api.get_construct_current_outputs(level="ALL")
+    outputs = extract_output_nodes(outputs_data)
+    if outputs:
+        target_output = outputs[0]
+        _print_step(f"Targeted output node [{target_output.name}] UUID: {target_output.uuid}")
+        return target_output.uuid
+
+    _print_step("No output node found on active construct, creating one")
+    created_output = projects_api.add_construct_current_output(ShotData(), level="ALL")
+    output_uuid = getattr(created_output, "uuid", None)
+    if not output_uuid:
+        raise RuntimeError("SCRATCH created an output node but did not return its UUID.")
+
+    output_name = getattr(created_output, "name", "MatAnyone_Output")
+    _print_step(f"Created output node [{output_name}] UUID: {output_uuid}")
+    return output_uuid
+
+
+def configure_current_output(config, output_uuid, output_path, single_frame=False):
+    endpoint = f"{config.host}/constructs/current/outputs/{output_uuid}"
+    response = requests.get(endpoint)
+    response.raise_for_status()
+    payload = response.json()
+
+    output_block = payload.setdefault("output", {})
+    output_block["outputpath"] = output_path
+
+    if single_frame:
+        payload["length"] = 1
+        handles = payload.setdefault("handles", {})
+        handles["frame_in"] = 0
+        handles["frame_out"] = 0
+        handles["start"] = handles.get("start", "")
+        handles["end"] = handles.get("end", "")
+
+    update_response = requests.put(endpoint, json=payload)
+    update_response.raise_for_status()
+    return update_response.json()
+
+
+def _extract_render_queue_items(queue_data):
+    if queue_data is None:
+        return []
+    if isinstance(queue_data, list):
+        return queue_data
+    for attr in ("items", "render_queue", "queue"):
+        value = getattr(queue_data, attr, None)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _http_get_json(config, path, timeout_seconds=5):
+    url = f"{config.host}{path}"
+    try:
+        response = requests.get(url, timeout=timeout_seconds)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException:
+        return None
+
+
+def _http_post_json(config, path, payload=None, timeout_seconds=5):
+    url = f"{config.host}{path}"
+    try:
+        response = requests.post(url, json=payload or {}, timeout=timeout_seconds)
+        if response.status_code in (404, 405):
+            return None
+        response.raise_for_status()
+        return response.json() if response.content else {}
+    except requests.RequestException:
+        return None
+
+
+def _http_post_attempt(config, path, payload=None, timeout_seconds=20):
+    url = f"{config.host}{path}"
+    try:
+        if payload is None:
+            response = requests.post(url, timeout=timeout_seconds)
+        else:
+            response = requests.post(url, json=payload, timeout=timeout_seconds)
+        detail = (response.text or "").strip().replace("\n", " ")
+        return response.status_code, detail[:240]
+    except requests.RequestException as error:
+        return None, str(error)
+
+
+def _try_start_render_via_rest(config, output_uuid, delete_existing_media=True):
+    payload = {"delete_existing_media": bool(delete_existing_media)}
+    attempts = [
+        ("add+start item, no payload", f"/application/render/{output_uuid}", None),
+        ("add+start item, with payload", f"/application/render/{output_uuid}", payload),
+        ("item start, no payload", f"/application/render/start/{output_uuid}", None),
+        ("item start, with payload", f"/application/render/start/{output_uuid}", payload),
+        ("global start, no payload", "/application/render/start", None),
+        ("global start, with payload", "/application/render/start", payload),
+    ]
+
+    for label, path, body in attempts:
+        status, detail = _http_post_attempt(config, path, payload=body, timeout_seconds=20)
+        _print_step(f"Start attempt [{label}] => status={status}, detail={detail}")
+        if status is not None and 200 <= int(status) < 300:
+            return label
+
+    raise RuntimeError("All documented render-start endpoint attempts failed")
+
+
+def _render_item_status(item_data):
+    if item_data is None:
+        return ""
+    if isinstance(item_data, dict):
+        return str(item_data.get("status", "")).lower()
+    return str(getattr(item_data, "status", "")).lower()
+
+
+def _render_item_path(item_data):
+    if item_data is None:
+        return None
+    if isinstance(item_data, dict):
+        return item_data.get("path")
+    return getattr(item_data, "path", None)
+
+
+def _collect_file_signatures(root_dirs, extensions):
+    signatures = {}
+    for root_dir in root_dirs:
+        if not root_dir or not os.path.isdir(root_dir):
+            continue
+        for walk_root, _dirs, files in os.walk(root_dir):
+            for file_name in files:
+                if not file_name.lower().endswith(extensions):
+                    continue
+                file_path = os.path.join(walk_root, file_name)
+                try:
+                    stat = os.stat(file_path)
+                except OSError:
+                    continue
+                signatures[file_path] = (stat.st_mtime_ns, stat.st_size)
+    return signatures
+
+
+def _count_changed_files(baseline_signatures, current_signatures):
+    changed = 0
+    for path, current_sig in current_signatures.items():
+        base_sig = baseline_signatures.get(path)
+        if base_sig != current_sig:
+            changed += 1
+    return changed
+
+
+def _infer_render_probe_dirs(config, output_uuid):
+    probe_dirs = []
+
+    queue_item = _http_get_json(config, f"/application/render/{output_uuid}", timeout_seconds=5)
+    queue_path = _render_item_path(queue_item)
+    if queue_path:
+        probe_dirs.append(queue_path)
+
+    output_item = _http_get_json(config, f"/constructs/current/outputs/{output_uuid}", timeout_seconds=5)
+    if isinstance(output_item, dict):
+        output_block = output_item.get("output") or {}
+        output_path = output_block.get("outputpath")
+        if output_path:
+            probe_dirs.append(output_path)
+
+            output_name = output_item.get("name")
+            if output_name:
+                probe_dirs.append(os.path.join(output_path, output_name))
+
+        file_path = output_item.get("file")
+        if file_path:
+            probe_dirs.append(os.path.dirname(file_path))
+
+    deduped = []
+    seen = set()
+    for path in probe_dirs:
+        if not path:
+            continue
+        norm = os.path.normpath(path)
+        if norm not in seen:
+            seen.add(norm)
+            deduped.append(path)
+    return deduped
+
+
+def wait_for_render_files(
+    probe_dirs,
+    render_started_at,
+    expected_min_files,
+    timeout_seconds=1800,
+    check_interval=3.0,
+    baseline_signatures=None,
+    stalled_retry_callback=None,
+    retry_after_seconds=30.0,
+):
+    """Wait for render completion by watching the filesystem only.
+    Makes zero REST/API calls so SCRATCH's render thread is never blocked.
+    """
+    probe_extensions = (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".dpx", ".exr")
+    start_time = time.time()
+    prev_count = -1
+    prev_changed = -1
+    stable_streak = 0
+    retried_once = False
+    expected_total = max(1, int(expected_min_files))
+    progress = tqdm(total=expected_total, desc="Render", unit="file", leave=True)
+
+    if baseline_signatures is None:
+        baseline_signatures = {}
+
+    try:
+        while True:
+            current_signatures = _collect_file_signatures(probe_dirs, probe_extensions)
+            changed_count = _count_changed_files(baseline_signatures, current_signatures)
+
+            files = recent_render_files(probe_dirs, render_started_at, probe_extensions)
+            if not files and changed_count > 0:
+                # Some SCRATCH render paths can rewrite files without mtime patterns
+                # that pass our started_at filter. Treat changed files as progress.
+                files = sorted(list(current_signatures.keys()))
+            count = len(files)
+
+            effective_progress = min(expected_total, max(count, changed_count))
+            progress.n = effective_progress
+            progress.set_postfix(found=count, changed=changed_count)
+            progress.refresh()
+
+            if count != prev_count:
+                _print_step(f"Render file progress: {count}/{expected_min_files}")
+                prev_count = count
+
+            if changed_count != prev_changed:
+                _print_step(f"Render changed files detected: {changed_count}")
+                prev_changed = changed_count
+
+            if max(count, changed_count) >= expected_total:
+                stable_streak += 1
+                if stable_streak >= 2:
+                    _print_step(f"Render complete: {count} file(s) found")
+                    return files
+            else:
+                stable_streak = 0
+
+            elapsed = time.time() - start_time
+            if (
+                not retried_once
+                and stalled_retry_callback is not None
+                and elapsed >= float(retry_after_seconds)
+                and max(count, changed_count) == 0
+            ):
+                retried_once = True
+                _print_step("No render file activity detected; retrying render start (fallback)")
+                try:
+                    stalled_retry_callback()
+                except Exception as error:
+                    _print_step(f"Fallback render start failed: {error}")
+
+            if elapsed > timeout_seconds:
+                if count > 0:
+                    _print_step(f"Render timeout but {count} file(s) found, continuing")
+                    return files
+                raise RuntimeError(f"No rendered files after {int(elapsed)}s in: {probe_dirs}")
+
+            time.sleep(check_interval)
+    finally:
+        progress.close()
+
+
+def recent_render_files(root_dirs, started_at, extensions):
+    recent_files = set()
+    for root_dir in root_dirs:
+        if not root_dir or not os.path.isdir(root_dir):
+            continue
+        for walk_root, _dirs, files in os.walk(root_dir):
+            for file_name in files:
+                file_path = os.path.join(walk_root, file_name)
+                if not file_name.lower().endswith(extensions):
+                    continue
+                if os.path.getmtime(file_path) + 1.0 >= started_at:
+                    recent_files.add(os.path.normpath(file_path))
+    return sorted(recent_files)
+
+
+def _api_patch_json(config, path, payload):
+    url = f"{config.host}{path}"
+    response = requests.patch(url, json=payload, timeout=20)
+    response.raise_for_status()
+    return response
+
+
+def _api_put_json(config, path, payload):
+    url = f"{config.host}{path}"
+    response = requests.put(url, json=payload, timeout=20)
+    response.raise_for_status()
+    return response
+
+
+def _get_shot_layers(projects_api, shot_uuid):
+    layers_data = projects_api.get_shot_layers(shot_uuid=shot_uuid)
+    return list(getattr(layers_data, "layers", []) or [])
+
+
+def _pick_mask_layer(layers, mask_layer_name, fallback_mode):
+    preferred_names = [name.strip().lower() for name in str(mask_layer_name).split(",") if name.strip()]
+    for idx, layer in enumerate(layers):
+        current_name = str(getattr(layer, "name", "")).strip().lower()
+        if current_name in preferred_names:
+            return idx
+
+    if fallback_mode == "strict":
+        return None
+
+    if fallback_mode == "first" and layers:
+        return 0
+
+    if fallback_mode == "top-visible":
+        for idx in range(len(layers) - 1, -1, -1):
+            if bool(getattr(layers[idx], "active", False)):
+                return idx
+
+    if fallback_mode == "top" and layers:
+        return len(layers) - 1
+
+    return None
+
+
+def _set_layer_active(config, shot_uuid, layer_idx, active):
+    layer_path = f"/shot/{shot_uuid}/layers/{layer_idx}"
+    payload = {"active": bool(active)}
+
+    try:
+        _api_patch_json(config, layer_path, payload)
+        return
+    except requests.HTTPError as error:
+        if error.response is None or error.response.status_code not in (404, 405):
+            raise
+
+    # Compatibility fallback for older/newer server behavior where only PUT is accepted.
+    _api_put_json(config, layer_path, payload)
+
+
+def _render_output_pass(app_api, output_uuid, expected_min_files=1):
+    config = app_api.api_client.configuration
+
+    # Resolve probe dirs BEFORE firing the render.
+    # SCRATCH 1.0.3: any REST call made while a render is processing blocks the
+    # render thread. We resolve everything we need upfront, then make NO API calls
+    # while waiting — we watch only the filesystem.
+    probe_dirs = _infer_render_probe_dirs(config, output_uuid)
+    if probe_dirs:
+        _print_step(f"Render output directories: {probe_dirs}")
+
+    probe_extensions = (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".dpx", ".exr")
+    baseline_signatures = _collect_file_signatures(probe_dirs, probe_extensions)
+
+    delete_payload = DeleteMediaData()
+    delete_payload.delete_existing_media = True
+    render_started_at = time.time()
+
+    # Queue hygiene for older servers: stale queue entries can block starts.
+    # Best-effort only; errors are intentionally ignored.
+    try:
+        app_api.do_application_render_stop()
+    except Exception:
+        pass
+    try:
+        app_api.delete_application_render_queue_item(output_uuid=output_uuid)
+    except Exception:
+        pass
+    try:
+        app_api.do_application_render_delete_media_item(output_uuid=output_uuid)
+        _print_step("Cleared existing media for output")
+    except Exception:
+        pass
+
+    selected_start = _try_start_render_via_rest(config, output_uuid, delete_existing_media=True)
+    _print_step(f"Render fired ({selected_start})")
+
+    def _fallback_restart_render():
+        try:
+            app_api.delete_application_render_queue_item(output_uuid=output_uuid)
+        except Exception:
+            pass
+
+        selected = _try_start_render_via_rest(config, output_uuid, delete_existing_media=True)
+        _print_step(f"Fallback fired ({selected})")
+
+    # From this point: ZERO REST calls until render is done.
+    # Watch filesystem only so SCRATCH render thread is never interrupted.
+    # Exception: one fallback global start if no file activity appears.
+    wait_for_render_files(
+        probe_dirs,
+        render_started_at,
+        expected_min_files=max(1, int(expected_min_files)),
+        baseline_signatures=baseline_signatures,
+        stalled_retry_callback=_fallback_restart_render,
+    )
+
+    path = probe_dirs[0] if probe_dirs else None
+    return {"status": "finished", "path": path, "uuid": str(output_uuid)}, render_started_at
+
+
+def _cleanup_temp_workspace(workspace_dir, keep_paths):
+    if not os.path.isdir(workspace_dir):
+        return
+
+    keep_abs = {os.path.abspath(path) for path in keep_paths}
+    for entry in os.listdir(workspace_dir):
+        full_path = os.path.abspath(os.path.join(workspace_dir, entry))
+        if full_path in keep_abs:
+            continue
+        try:
+            if os.path.isdir(full_path):
+                shutil.rmtree(full_path)
+            else:
+                os.remove(full_path)
+        except Exception:
+            pass
+
+
+def _to_binary_mask(source_path, target_path):
+    with Image.open(source_path) as image:
+        gray = image.convert("L")
+        binary = gray.point(lambda px: 255 if px >= 128 else 0, mode="L")
+        binary.save(target_path)
+
+
+def _resize_preserving_aspect(image, target_min_side):
+    width, height = image.size
+    current_min = min(width, height)
+    if target_min_side <= 0 or current_min <= target_min_side:
+        return image, (width, height)
+
+    scale = float(target_min_side) / float(current_min)
+    new_w = max(1, int(round(width * scale)))
+    new_h = max(1, int(round(height * scale)))
+    return image.resize((new_w, new_h), Image.BILINEAR), (width, height)
+
+
+def _prepare_batch_input(batch_frames, batch_input_dir, target_min_side):
+    original_sizes = {}
+    for frame_path in batch_frames:
+        base_name = os.path.basename(frame_path)
+        destination = os.path.join(batch_input_dir, base_name)
+        with Image.open(frame_path) as src:
+            rgb = src.convert("RGB")
+            resized, original_size = _resize_preserving_aspect(rgb, target_min_side)
+            original_sizes[base_name] = original_size
+            resized.save(destination)
+    return original_sizes
+
+
+def _restore_alpha_size(alpha_src_path, alpha_dst_path, expected_size):
+    with Image.open(alpha_src_path) as alpha_image:
+        gray = alpha_image.convert("L")
+        if gray.size != expected_size:
+            gray = gray.resize(expected_size, Image.BILINEAR)
+        gray.save(alpha_dst_path)
+
+
+def _prepare_mask_for_batch(mask_src_path, reference_frame_path, mask_dst_path):
+    with Image.open(reference_frame_path) as ref_image:
+        target_size = ref_image.size
+
+    with Image.open(mask_src_path) as mask_image:
+        gray = mask_image.convert("L")
+        if gray.size != target_size:
+            gray = gray.resize(target_size, Image.NEAREST)
+        gray.save(mask_dst_path)
+
+
+def _chunk_ranges(total_frames, chunk_size, overlap):
+    if total_frames <= 0:
+        return []
+    chunk_size = max(1, chunk_size)
+    overlap = max(0, min(overlap, chunk_size - 1))
+
+    ranges = []
+    start = 0
+    while start < total_frames:
+        end = min(total_frames, start + chunk_size)
+        ranges.append((start, end))
+        if end >= total_frames:
+            break
+        start = end - overlap
+    return ranges
+
+
+def _try_import_matte_sequence(config, shot_uuid, final_alpha_dir, mode):
+    if mode == "manual":
+        return False, "Manual import mode requested"
+
+    payload = {
+        "shot_uuid": shot_uuid,
+        "media_path": final_alpha_dir,
+        "as_new_version": True,
+    }
+
+    try:
+        response = requests.post(
+            f"{config.host}/construct/import_media",
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return True, "Imported matte via /construct/import_media"
+    except Exception as error:
+        if mode == "api-only":
+            raise RuntimeError(f"Matte import failed in api-only mode: {error}")
+        return False, f"Import API unavailable: {error}"
+
+
+def _write_shot_note(config, shot_uuid, note_text, status):
+    endpoint = f"{config.host}/shot/{shot_uuid}"
+    response = requests.get(endpoint, timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+
+    notes = payload.get("notes") or []
+    notes.append(
+        {
+            "text": note_text,
+            "note": note_text,
+            "status": int(status),
+            "frame": 0,
+        }
+    )
+    payload["notes"] = notes
+
+    put_response = requests.put(endpoint, json=payload, timeout=20)
+    put_response.raise_for_status()
+
+# =========================================================================
+# --- STEP 2: VRAM LIMIT CALCULATOR & PRE-FLIGHT CHECKS ------------------
+# =========================================================================
+def get_safe_batch_limit():
+    """
+    Queries CUDA runtime for free VRAM bytes.
+    Computes maximum frame batch windows dynamically to guarantee no OOM.
+    """
+    if not torch.cuda.is_available():
+        return 8
+
+    torch.cuda.empty_cache()
+    free_vram, _ = torch.cuda.mem_get_info(device=0)
+    free_vram_gb = free_vram / (1024 ** 3)
+    
+    # Keep 3GB reserved for base model weights and desktop UI threads
+    usable_vram_mb = (free_vram_gb - 3.0) * 1024
+    
+    # 45MB represents the estimated deep layer feature footprint size per frame at 1080p
+    max_frames = int(usable_vram_mb / 45.0)  
+    
+    # Clamp processing chunk sizes to prevent edge-case pipeline crashes
+    return max(16, min(max_frames, 120))
+
+
+def get_inference_device(require_cuda=False):
+    cuda_available = bool(torch.cuda.is_available())
+    cuda_build = torch.version.cuda
+    device_count = int(torch.cuda.device_count()) if cuda_available else 0
+
+    if cuda_available and device_count > 0:
+        return "cuda:0"
+
+    reason = (
+        f"CUDA unavailable (torch.version.cuda={cuda_build}, "
+        f"cuda_available={cuda_available}, device_count={device_count})"
+    )
+    if require_cuda:
+        raise RuntimeError(f"{reason}. Install a CUDA-enabled PyTorch build in the runtime environment.")
+
+    _print_step(f"Warning: {reason}. Falling back to CPU inference.")
+    return "cpu"
+
+
+# =========================================================================
+# --- MAIN PIPELINE INTERACTION ENGINE ------------------------------------
+# =========================================================================
+def run_option1_pipeline(args):
+    # 1. Setup API Connection Configuration pointing to APIV2
+    config = Configuration()
+    config.host = f"{args.scratch_host.rstrip('/')}/APIV2"
+    
+    api_client = ApiClient(config)
+    system_api = SystemApi(api_client)
+    projects_api = ProjectsApi(api_client)
+    app_api = ApplicationApi(api_client)
+    
+    try:
+        server_version = system_api.get_system_properties().rest_version
+        _print_step(f"Connected to Assimilate REST V2, server version: {server_version}")
+        log_version_support(server_version)
+
+        shot = resolve_target_shot(projects_api, app_api, args)
+        shot_uuid = shot.uuid
+        _print_step(f"Using cache directory: {args.cache_dir}")
+
+    except ApiException as e:
+        _print_step(f"Handshake failed: {e.body.decode('utf-8') if e.body else str(e)}")
+        return None
+
+    # Build workspace directories mapping to the shot's unique identifier
+    workspace_dir = os.path.join(args.cache_dir, shot_uuid)
+    export_dir = os.path.join(workspace_dir, "source_frames")
+    output_dir = os.path.join(workspace_dir, "results")
+    final_alpha_dir = os.path.join(output_dir, "alpha")
+    mask_render_dir = os.path.join(workspace_dir, "mask_render")
+    
+    os.makedirs(export_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(final_alpha_dir, exist_ok=True)
+    os.makedirs(mask_render_dir, exist_ok=True)
+    mask_path = os.path.join(workspace_dir, "mask.png")
+
+
+    _print_step("Resolving construct output node")
+    try:
+        output_uuid = ensure_current_output(projects_api)
+    except Exception as e:
+        raise RuntimeError(f"Failed to resolve/create a construct output node: {e}")
+
+    layers = _get_shot_layers(projects_api, shot_uuid)
+    target_layer_idx = _pick_mask_layer(layers, args.mask_layer_name, args.mask_layer_fallback)
+    if target_layer_idx is None:
+        available_names = [str(getattr(layer, "name", "")) for layer in layers]
+        raise RuntimeError(
+            f"Could not resolve mask layer names '{args.mask_layer_name}' with fallback='{args.mask_layer_fallback}'. "
+            f"Available layers: {available_names}"
+        )
+
+    expected_plate_count = int(getattr(shot, "length", 0) or 0)
+    if expected_plate_count > 0:
+        _print_step(f"PASS A: rendering clean plates 1/{expected_plate_count}..{expected_plate_count}/{expected_plate_count}")
+    else:
+        _print_step("PASS A: rendering clean plate sequence with mask layer disabled")
+    try:
+        _set_layer_active(config, shot_uuid, target_layer_idx, False)
+        configure_current_output(config, output_uuid, export_dir, single_frame=False)
+        queue_item, render_started_at = _render_output_pass(
+            app_api,
+            output_uuid,
+            expected_min_files=max(1, expected_plate_count),
+        )
+        render_source_dir = _render_item_path(queue_item) or export_dir
+    except Exception as e:
+        raise RuntimeError(f"Failed during Pass A clean plate render: {e}")
+    finally:
+        _set_layer_active(config, shot_uuid, target_layer_idx, True)
+
+    _print_step(f"PASS B: rendering mask from layer index {target_layer_idx}")
+    _print_step("Rendering mask frame 1/1")
+    try:
+        _set_layer_active(config, shot_uuid, target_layer_idx, True)
+        configure_current_output(config, output_uuid, mask_render_dir, single_frame=True)
+        mask_queue_item, mask_render_started_at = _render_output_pass(app_api, output_uuid, expected_min_files=1)
+
+        mask_source_dir = _render_item_path(mask_queue_item) or mask_render_dir
+
+        generated_mask_files = recent_render_files(
+            [mask_render_dir, mask_source_dir],
+            mask_render_started_at,
+            (".tif", ".tiff", ".png"),
+        )
+        if not generated_mask_files:
+            generated_mask_files = recent_render_files(
+                [mask_render_dir, mask_source_dir],
+                0,
+                (".tif", ".tiff", ".png"),
+            )
+        if not generated_mask_files:
+            raise RuntimeError("Mask pass finished but no image file was produced")
+        _to_binary_mask(generated_mask_files[0], mask_path)
+        _print_step(f"Mask pass complete: {mask_path}")
+    except Exception as e:
+        raise RuntimeError(f"Failed during Pass B mask extraction: {e}")
+
+    _print_step("Running MatAnyone2 with VRAM-based chunking")
+    all_frames = recent_render_files(
+        [render_source_dir, export_dir],
+        render_started_at,
+        (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".dpx"),
+    )
+    if not all_frames:
+        all_frames = recent_render_files(
+            [render_source_dir, export_dir],
+            0,
+            (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".dpx"),
+        )
+
+    total_frames = len(all_frames)
+    if total_frames == 0:
+        raise RuntimeError(f"No clean plate frames found in: {export_dir}")
+
+    frames_per_chunk = get_safe_batch_limit()
+    device = get_inference_device(require_cuda=args.require_cuda)
+    _print_step(f"MatAnyone inference device: {device}; chunk size: {frames_per_chunk}; overlap: {args.chunk_overlap}")
+
+    _print_step("Loading MatAnyone2 weights")
+    model = MatAnyone2.from_pretrained("PeiqingYang/MatAnyone2")
+    # Keep fp32 weights for compatibility with MatAnyone2 internals on some CUDA paths.
+    model = model.to(device)
+
+    ranges = _chunk_ranges(total_frames, frames_per_chunk, args.chunk_overlap)
+    active_mask_path = mask_path
+
+    for chunk_idx, (current_start, current_end) in enumerate(ranges):
+        _print_step(f"Processing chunk {chunk_idx + 1}/{len(ranges)}: frames {current_start}..{current_end - 1}")
+
+        batch_input_dir = os.path.join(workspace_dir, f"batch_{current_start}_in")
+        batch_output_dir = os.path.join(workspace_dir, f"batch_{current_start}_out")
+        os.makedirs(batch_input_dir, exist_ok=True)
+        os.makedirs(batch_output_dir, exist_ok=True)
+
+        batch_frames = all_frames[current_start:current_end]
+        original_sizes = _prepare_batch_input(batch_frames, batch_input_dir, args.max_min_side)
+
+        processor = InferenceCore(model, device=device)
+        batch_mask_path = active_mask_path
+        if batch_frames:
+            reference_frame = os.path.join(batch_input_dir, os.path.basename(batch_frames[0]))
+            if os.path.isfile(reference_frame):
+                prepared_mask_path = os.path.join(workspace_dir, f"mask_for_{current_start}.png")
+                _prepare_mask_for_batch(active_mask_path, reference_frame, prepared_mask_path)
+                batch_mask_path = prepared_mask_path
+
+        autocast_context = (
+            torch.amp.autocast("cuda", dtype=torch.float16)
+            if device.startswith("cuda")
+            else contextlib.nullcontext()
+        )
+        with autocast_context:
+            processor.process_video(
+                input_path=batch_input_dir,
+                mask_path=batch_mask_path,
+                output_path=batch_output_dir
+            )
+
+        chunk_alpha_src = os.path.join(batch_output_dir, "alpha")
+        generated_alphas = sorted(os.listdir(chunk_alpha_src)) if os.path.isdir(chunk_alpha_src) else []
+        if not generated_alphas:
+            raise RuntimeError(f"Inference produced no alpha outputs for chunk {chunk_idx + 1}")
+
+        skip_count = args.chunk_overlap if chunk_idx > 0 else 0
+        usable_alphas = generated_alphas[skip_count:] if skip_count < len(generated_alphas) else generated_alphas[-1:]
+
+        for alpha_file in usable_alphas:
+            alpha_source = os.path.join(chunk_alpha_src, alpha_file)
+            alpha_target = os.path.join(final_alpha_dir, alpha_file)
+            expected_size = original_sizes.get(alpha_file)
+            if expected_size is None and batch_frames:
+                fallback_name = os.path.basename(batch_frames[0])
+                expected_size = original_sizes.get(fallback_name, (1920, 1080))
+            _restore_alpha_size(alpha_source, alpha_target, expected_size)
+
+        last_generated_alpha = os.path.join(chunk_alpha_src, generated_alphas[-1])
+        active_mask_path = os.path.join(workspace_dir, f"prop_mask_{current_end}.png")
+        shutil.copy(last_generated_alpha, active_mask_path)
+
+        del processor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        try:
+            shutil.rmtree(batch_input_dir)
+            shutil.rmtree(batch_output_dir)
+        except Exception:
+            pass
+
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    _print_step("Attempting to load generated matte back into SCRATCH")
+    imported, import_message = _try_import_matte_sequence(config, shot_uuid, final_alpha_dir, args.import_mode)
+    _print_step(import_message)
+
+    note_text = (
+        f"MatAnyone2 matte generated. shot={shot_uuid}; alpha_dir={final_alpha_dir}; "
+        f"imported={imported}; mode={args.import_mode}"
+    )
+    try:
+        _write_shot_note(config, shot_uuid, note_text, args.note_status)
+        _print_step("Shot note written")
+    except Exception as error:
+        _print_step(f"Shot note write failed (non-fatal): {error}")
+
+    if not args.keep_temp:
+        keep_paths = [final_alpha_dir]
+        _cleanup_temp_workspace(workspace_dir, keep_paths=keep_paths)
+        _print_step(f"Temporary files cleaned. Preserved: {final_alpha_dir}")
+
+    _print_step("Pipeline execution completed")
+
+if __name__ == "__main__":
+    argument_parser = build_argument_parser()
+    run_option1_pipeline(argument_parser.parse_args())
+
+
+
