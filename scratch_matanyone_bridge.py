@@ -488,6 +488,13 @@ def _api_put_json(config, path, payload):
     return response
 
 
+def _api_post_json(config, path, payload):
+    url = f"{config.host}{path}"
+    response = requests.post(url, json=payload, timeout=20)
+    response.raise_for_status()
+    return response
+
+
 def _get_shot_layers(projects_api, shot_uuid):
     layers_data = projects_api.get_shot_layers(shot_uuid=shot_uuid)
     return list(getattr(layers_data, "layers", []) or [])
@@ -597,7 +604,20 @@ def _cleanup_temp_workspace(workspace_dir, keep_paths):
     if not os.path.isdir(workspace_dir):
         return
 
-    keep_abs = {os.path.abspath(path) for path in keep_paths}
+    workspace_abs = os.path.abspath(workspace_dir)
+    keep_abs = set()
+    for path in keep_paths:
+        current = os.path.abspath(path)
+        # Keep the requested path and its parents up to workspace root.
+        while True:
+            keep_abs.add(current)
+            if current == workspace_abs:
+                break
+            parent = os.path.abspath(os.path.dirname(current))
+            if parent == current:
+                break
+            current = parent
+
     for entry in os.listdir(workspace_dir):
         full_path = os.path.abspath(os.path.join(workspace_dir, entry))
         if full_path in keep_abs:
@@ -679,28 +699,201 @@ def _chunk_ranges(total_frames, chunk_size, overlap):
     return ranges
 
 
-def _try_import_matte_sequence(config, shot_uuid, final_alpha_dir, mode):
+def _try_import_matte_sequence(config, projects_api, shot_uuid, slot_idx, final_alpha_dir, mode):
     if mode == "manual":
-        return False, "Manual import mode requested"
+        return False, f"Manual import mode — alpha frames at: {final_alpha_dir}"
 
-    payload = {
-        "shot_uuid": shot_uuid,
-        "media_path": final_alpha_dir,
-        "as_new_version": True,
-    }
-
-    try:
-        response = requests.post(
-            f"{config.host}/construct/import_media",
-            json=payload,
-            timeout=30,
-        )
-        response.raise_for_status()
-        return True, "Imported matte via /construct/import_media"
-    except Exception as error:
+    alpha_files = sorted(
+        f for f in os.listdir(final_alpha_dir)
+        if f.lower().endswith((".png", ".jpg", ".tif", ".tiff", ".exr"))
+    )
+    if not alpha_files:
         if mode == "api-only":
-            raise RuntimeError(f"Matte import failed in api-only mode: {error}")
-        return False, f"Import API unavailable: {error}"
+            raise RuntimeError("No alpha frames found in output directory")
+        return False, f"No alpha frames found in: {final_alpha_dir}"
+
+    first_frame_path = os.path.normpath(os.path.join(final_alpha_dir, alpha_files[0]))
+
+    # On SCRATCH 1.0.3 the move_shot (PATCH) endpoint is missing, so new versions
+    # cannot be added to existing slots via REST.
+    # Best available approach: add_shot creates the shot in the library,
+    # then attempt move_shot — if it fails (expected on 1.0.3), fall through.
+    from assimilate_client import ShotData as _ShotData, MoveShotData as _MoveShotData
+
+    new_shot_uuid = None
+    try:
+        body = _ShotData()
+        body.file = first_frame_path
+        body.name = f"MatAnyone_matte_{shot_uuid[:8]}"
+        new_shot = projects_api.add_shot(body=body)
+        new_shot_uuid = getattr(new_shot, "uuid", None)
+        if not new_shot_uuid:
+            raise RuntimeError("add_shot returned no UUID")
+        _print_step(f"Created matte shot in library: {new_shot_uuid}")
+    except Exception as create_error:
+        if mode == "api-only":
+            raise RuntimeError(f"add_shot failed: {create_error}")
+        _print_step(f"add_shot unavailable ({create_error.__class__.__name__}): {create_error}")
+
+    if new_shot_uuid:
+        try:
+            # Get the count of existing versions to find the next index.
+            versions_data = projects_api.get_construct_current_slot_versions(slot_idx=int(slot_idx))
+            existing = getattr(versions_data, "shots", None) or []
+            next_version_idx = len(existing)
+
+            move_body = _MoveShotData()
+            move_body.slot_idx = int(slot_idx)
+            move_body.version_idx = next_version_idx
+            move_body.create_copy = False
+            projects_api.move_shot(body=move_body, shot_uuid=new_shot_uuid)
+            return True, (
+                f"Matte added to slot {slot_idx} version {next_version_idx} "
+                f"(uuid={new_shot_uuid})"
+            )
+        except Exception as move_error:
+            _print_step(
+                f"move_shot not available on this server build "
+                f"({move_error.__class__.__name__}). Trying add-shot-layer fallback."
+            )
+
+            try:
+                layers_before = _get_shot_layers(projects_api, shot_uuid)
+                layer_name = "MatAnyone_Matte"
+                matte_payload = {
+                    "shot_uuid": new_shot_uuid,
+                    "blend_mode": "Copy",
+                    "blur": 0,
+                    "blur_angle": 0,
+                    "blur_dir_active": False,
+                    "channel_mask": {"R": True, "G": True, "B": True, "A": True},
+                    "map": "Projected",
+                    "slip": 0,
+                    "orientation": {"rot": 0, "sx": 1, "sy": 1, "tx": 0, "ty": 0},
+                    "warp": "None",
+                    "warp_blur_filter": 0,
+                    "warp_equi_dist": 0,
+                }
+                layer_payload = {
+                    "name": layer_name,
+                    "active": True,
+                    "group": False,
+                    "matte": matte_payload,
+                }
+
+                create_response = _api_post_json(config, f"/shot/{shot_uuid}/layers/new", layer_payload)
+
+                def _field(obj, key, default=None):
+                    if isinstance(obj, dict):
+                        return obj.get(key, default)
+                    return getattr(obj, key, default)
+
+                def _layer_part_uuid(layer_obj, part_name):
+                    part = _field(layer_obj, part_name, {})
+                    return _field(part, "shot_uuid", None)
+
+                new_layer_idx = None
+                with contextlib.suppress(Exception):
+                    response_json = create_response.json()
+                    for key in ("layer_idx", "index", "idx"):
+                        candidate = response_json.get(key)
+                        if isinstance(candidate, int):
+                            new_layer_idx = candidate
+                            break
+
+                layers_after = _get_shot_layers(projects_api, shot_uuid)
+                if new_layer_idx is None:
+                    for idx in range(len(layers_after) - 1, -1, -1):
+                        layer = layers_after[idx]
+                        if str(_field(layer, "name", "")).strip() != layer_name:
+                            continue
+                        matte_uuid = _layer_part_uuid(layer, "matte")
+                        if matte_uuid == new_shot_uuid:
+                            new_layer_idx = idx
+                            break
+
+                if new_layer_idx is None:
+                    if len(layers_after) > len(layers_before):
+                        new_layer_idx = len(layers_before)
+                    elif layers_after:
+                        new_layer_idx = len(layers_after) - 1
+                    else:
+                        raise RuntimeError("Could not resolve created layer index")
+
+                _print_step(f"Resolved MatAnyone_Matte layer index: {new_layer_idx}")
+
+                # Ensure Fill is empty/reset: this layer should carry matte only.
+                try:
+                    requests.delete(
+                        f"{config.host}/shot/{shot_uuid}/layers/{new_layer_idx}/fill",
+                        timeout=20,
+                    ).raise_for_status()
+                except Exception:
+                    pass
+
+                _api_put_json(config, f"/shot/{shot_uuid}/layers/{new_layer_idx}/matte", matte_payload)
+
+                # Read back matte assignment to verify SCRATCH persisted it.
+                matte_readback = requests.get(
+                    f"{config.host}/shot/{shot_uuid}/layers/{new_layer_idx}/matte",
+                    timeout=20,
+                )
+                matte_readback.raise_for_status()
+                persisted_matte_uuid = matte_readback.json().get("shot_uuid")
+                if persisted_matte_uuid != new_shot_uuid:
+                    _print_step(
+                        "Layer matte did not persist after set-shot-layer-matte; "
+                        "retrying with full set-shot-layer payload"
+                    )
+                    _api_put_json(
+                        config,
+                        f"/shot/{shot_uuid}/layers/{new_layer_idx}",
+                        {
+                            "name": layer_name,
+                            "active": True,
+                            "group": False,
+                            "matte": matte_payload,
+                        },
+                    )
+                    # Keep Fill cleared after full-layer update.
+                    with contextlib.suppress(Exception):
+                        requests.delete(
+                            f"{config.host}/shot/{shot_uuid}/layers/{new_layer_idx}/fill",
+                            timeout=20,
+                        ).raise_for_status()
+
+                    matte_readback = requests.get(
+                        f"{config.host}/shot/{shot_uuid}/layers/{new_layer_idx}/matte",
+                        timeout=20,
+                    )
+                    matte_readback.raise_for_status()
+                    persisted_matte_uuid = matte_readback.json().get("shot_uuid")
+
+                if persisted_matte_uuid != new_shot_uuid:
+                    raise RuntimeError(
+                        "Layer matte assignment mismatch after write-back "
+                        f"(expected {new_shot_uuid}, got {persisted_matte_uuid})"
+                    )
+
+                return True, (
+                    f"Matte linked as layer {new_layer_idx} on shot {shot_uuid} "
+                    f"using source shot {new_shot_uuid}"
+                )
+            except Exception as layer_error:
+                _print_step(
+                    f"add-shot-layer fallback failed ({layer_error.__class__.__name__}): {layer_error}"
+                )
+                return False, (
+                    f"Shot created in library (uuid={new_shot_uuid}) but could not be placed "
+                    f"automatically (server 1.0.3 limitation). "
+                    f"First alpha frame: {first_frame_path}"
+                )
+
+    return False, (
+        f"Import not supported on this server build. "
+        f"Drag the sequence into SCRATCH manually. "
+        f"First frame: {first_frame_path}"
+    )
 
 
 def _write_shot_note(config, shot_uuid, note_text, status):
@@ -930,8 +1123,42 @@ def run_option1_pipeline(args):
             )
 
         chunk_alpha_src = os.path.join(batch_output_dir, "alpha")
-        generated_alphas = sorted(os.listdir(chunk_alpha_src)) if os.path.isdir(chunk_alpha_src) else []
+        generated_alphas = []
+
+        # MatAnyone2 may output video files instead of image sequences.
+        # Detect *_pha.mp4 (alpha channel video) and extract frames to alpha/.
+        pha_video = None
+        for fname in os.listdir(batch_output_dir):
+            if fname.lower().endswith(".mp4") and "_pha" in fname.lower():
+                pha_video = os.path.join(batch_output_dir, fname)
+                break
+
+        if pha_video:
+            import imageio
+            os.makedirs(chunk_alpha_src, exist_ok=True)
+            _print_step(f"Extracting alpha frames from video: {os.path.basename(pha_video)}")
+            reader = imageio.get_reader(pha_video)
+            for frame_idx, frame in enumerate(reader):
+                frame_name = f"{frame_idx:06d}.png"
+                frame_path = os.path.join(chunk_alpha_src, frame_name)
+                Image.fromarray(frame).convert("L").save(frame_path)
+            reader.close()
+            _print_step(f"Extracted {frame_idx + 1} alpha frames")
+
+        # Collect extracted or conventionally placed image frames.
+        if os.path.isdir(chunk_alpha_src):
+            generated_alphas = sorted(
+                f for f in os.listdir(chunk_alpha_src)
+                if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff", ".exr"))
+            )
+
         if not generated_alphas:
+            tree = []
+            for walk_root, _dirs, walk_files in os.walk(batch_output_dir):
+                rel = os.path.relpath(walk_root, batch_output_dir)
+                for fname in walk_files:
+                    tree.append(f"  {rel}/{fname}")
+            _print_step("batch_output_dir tree:\n" + ("\n".join(tree) if tree else "  (empty)"))
             raise RuntimeError(f"Inference produced no alpha outputs for chunk {chunk_idx + 1}")
 
         skip_count = args.chunk_overlap if chunk_idx > 0 else 0
@@ -965,7 +1192,18 @@ def run_option1_pipeline(args):
         torch.cuda.empty_cache()
 
     _print_step("Attempting to load generated matte back into SCRATCH")
-    imported, import_message = _try_import_matte_sequence(config, shot_uuid, final_alpha_dir, args.import_mode)
+    try:
+        selected = projects_api.get_construct_current_selected_shots(level="ALL")
+        selections = _extract_selected_entries(selected)
+        shot_slot_idx = 0
+        if selections:
+            shot_slot_idx = int(getattr(selections[0], "slot_idx", 0) or 0)
+    except Exception:
+        shot_slot_idx = 0
+
+    imported, import_message = _try_import_matte_sequence(
+        config, projects_api, shot_uuid, shot_slot_idx, final_alpha_dir, args.import_mode
+    )
     _print_step(import_message)
 
     note_text = (
@@ -982,6 +1220,13 @@ def run_option1_pipeline(args):
         keep_paths = [final_alpha_dir]
         _cleanup_temp_workspace(workspace_dir, keep_paths=keep_paths)
         _print_step(f"Temporary files cleaned. Preserved: {final_alpha_dir}")
+
+    # Open the alpha folder in Explorer so the user can drag into SCRATCH if needed.
+    try:
+        import subprocess
+        subprocess.Popen(f'explorer "{os.path.normpath(final_alpha_dir)}"')
+    except Exception:
+        pass
 
     _print_step("Pipeline execution completed")
 
