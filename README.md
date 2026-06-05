@@ -47,17 +47,3 @@ Mask Layer
 Run Manually
 Use launcher (recommended because it sets CUDA wheel/index and cache locations):
 launcher.bat -project <PRJ> -group <GRP> -construct <CON> -shot <SHT>
-
-Git / GitHub
-Initialize local git:
-git init
-git add .
-git commit -m "Initial AI matte bridge"
-
-Create and push GitHub repository (if GitHub CLI is installed and authenticated):
-gh repo create AI_matte --private --source . --remote origin --push
-
-If gh is not installed, create an empty repo on GitHub web and then run:
-git remote add origin https://github.com/<your-user>/AI_matte.git
-git branch -M main
-git push -u origin main
