@@ -7,6 +7,9 @@
 #     "tqdm>=4.66.0",
 #     "torch>=2.2.0",
 #     "torchvision>=0.17.0",
+#     "gradio>=4.26.0",
+#     "opencv-python-headless>=4.8.0",
+#     "sam2 @ git+https://github.com/facebookresearch/sam2.git",
 #     "matanyone2 @ git+https://github.com/osmaras/MatAnyone2.git",
 #     "assimilate_client @ git+https://github.com/Assimilate-Inc/Assimilate-REST.git",
 # ]
@@ -15,6 +18,7 @@
 import argparse
 import contextlib
 import os
+import sys
 import time
 import torch
 import shutil
@@ -99,6 +103,22 @@ def build_argument_parser():
         "--require-cuda",
         action="store_true",
         help="Fail if CUDA GPU inference is not available.",
+    )
+    parser.add_argument(
+        "--skip-sam",
+        action="store_true",
+        help="Skip the SAM2 interactive editor and reuse an existing mask.png if present.",
+    )
+    parser.add_argument(
+        "--sam-port",
+        type=int,
+        default=7860,
+        help="Local port for the Gradio SAM2 editor (default: 7860).",
+    )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Do not open the browser automatically when launching the SAM2 editor.",
     )
     return parser
 
@@ -1034,34 +1054,8 @@ def run_option1_pipeline(args):
     finally:
         _set_layer_active(config, shot_uuid, target_layer_idx, True)
 
-    _print_step(f"PASS B: rendering mask from layer index {target_layer_idx}")
-    _print_step("Rendering mask frame 1/1")
-    try:
-        _set_layer_active(config, shot_uuid, target_layer_idx, True)
-        configure_current_output(config, output_uuid, mask_render_dir, single_frame=True)
-        mask_queue_item, mask_render_started_at = _render_output_pass(app_api, output_uuid, expected_min_files=1)
-
-        mask_source_dir = _render_item_path(mask_queue_item) or mask_render_dir
-
-        generated_mask_files = recent_render_files(
-            [mask_render_dir, mask_source_dir],
-            mask_render_started_at,
-            (".tif", ".tiff", ".png"),
-        )
-        if not generated_mask_files:
-            generated_mask_files = recent_render_files(
-                [mask_render_dir, mask_source_dir],
-                0,
-                (".tif", ".tiff", ".png"),
-            )
-        if not generated_mask_files:
-            raise RuntimeError("Mask pass finished but no image file was produced")
-        _to_binary_mask(generated_mask_files[0], mask_path)
-        _print_step(f"Mask pass complete: {mask_path}")
-    except Exception as e:
-        raise RuntimeError(f"Failed during Pass B mask extraction: {e}")
-
-    _print_step("Running MatAnyone2 with VRAM-based chunking")
+    # ── Collect clean plate frames (needed for both the SAM2 editor and MatAnyone) ──
+    _print_step("Collecting rendered clean plate frames")
     all_frames = recent_render_files(
         [render_source_dir, export_dir],
         render_started_at,
@@ -1073,13 +1067,43 @@ def run_option1_pipeline(args):
             0,
             (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".dpx"),
         )
-
     total_frames = len(all_frames)
     if total_frames == 0:
         raise RuntimeError(f"No clean plate frames found in: {export_dir}")
 
-    frames_per_chunk = get_safe_batch_limit()
     device = get_inference_device(require_cuda=args.require_cuda)
+
+    # ── PASS B: Interactive SAM2 mask editor ────────────────────────────────
+    if args.skip_sam and os.path.isfile(mask_path):
+        _print_step(f"PASS B skipped (--skip-sam): reusing existing mask → {mask_path}")
+    else:
+        _print_step("PASS B: Launching SAM2 interactive mask editor")
+        _print_step(f"  Source frame : {all_frames[0]}")
+        _print_step(f"  Mask output  : {mask_path}")
+        _print_step("A browser window will open. Click on subjects, then click 'Save & Continue'.")
+
+        _editor_dir = os.path.dirname(os.path.abspath(__file__))
+        if _editor_dir not in sys.path:
+            sys.path.insert(0, _editor_dir)
+        from sam_mask_editor import launch_mask_editor  # noqa: PLC0415
+
+        launch_mask_editor(
+            frame_path=all_frames[0],
+            output_mask_path=mask_path,
+            device=device,
+            port=args.sam_port,
+            open_browser=not args.no_browser,
+        )
+
+        if not os.path.isfile(mask_path):
+            raise RuntimeError(
+                "The SAM2 editor closed without saving a mask. "
+                "Re-run or use --skip-sam with an existing mask.png."
+            )
+        _print_step(f"PASS B complete: mask saved → {mask_path}")
+
+    _print_step("Running MatAnyone2 with VRAM-based chunking")
+    frames_per_chunk = get_safe_batch_limit()
     _print_step(f"MatAnyone inference device: {device}; chunk size: {frames_per_chunk}; overlap: {args.chunk_overlap}")
 
     _print_step("Loading MatAnyone2 weights")

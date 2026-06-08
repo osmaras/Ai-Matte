@@ -1,8 +1,7 @@
 @echo off
-V:
-cd "V:\PROGRAMING\Scratch-Scripts\AI_matte"
+pushd "%~dp0"
 
-set "UV_CACHE_BASE=V:\PROGRAMING\Scratch-Scripts\AI_matte"
+set "UV_CACHE_BASE=%~dp0"
 if exist "G:\" set "UV_CACHE_BASE=G:\Scratch-AI-matte-cache"
 
 if not exist "%UV_CACHE_BASE%\.uv-cache" mkdir "%UV_CACHE_BASE%\.uv-cache"
