@@ -917,6 +917,394 @@ def _write_shot_note(config, shot_uuid, note_text, status):
     put_response.raise_for_status()
 
 # =========================================================================
+# --- MASK LAYER MANAGEMENT (SCRATCH Human Workflow Automation) ----------
+# =========================================================================
+
+def _disable_all_layers_except(config, shot_uuid, layers, keep_idx):
+    """Disable all layers except the one at keep_idx."""
+    for idx in range(len(layers)):
+        if idx == keep_idx:
+            continue
+        layer = layers[idx]
+        if getattr(layer, "group", False):
+            continue  # Skip group layers
+        try:
+            _set_layer_active(config, shot_uuid, idx, False)
+        except Exception as e:
+            _print_step(f"Warning: could not disable layer {idx}: {e}")
+
+
+def _restore_all_layers(config, shot_uuid, layer_states):
+    """Restore layers to their original active states."""
+    for idx, was_active in layer_states.items():
+        try:
+            _set_layer_active(config, shot_uuid, idx, was_active)
+        except Exception as e:
+            _print_step(f"Warning: could not restore layer {idx}: {e}")
+
+
+def _save_layer_states(layers):
+    """Save active state of all layers."""
+    return {idx: bool(getattr(layer, "active", False)) for idx, layer in enumerate(layers)}
+
+
+def _create_dedicated_mask_layer(config, shot_uuid, layer_name="MatAnyone_Mask"):
+    """Create a new dedicated layer for the garbage mask.
+    
+    Mirrors the human workflow:
+    1. Create a new layer where we will draw the garbage mask
+    2. Configure it with brightness=0 (via colorgrade), invert (via canvas), 
+       and matte blend mode = Subtract
+    """
+    layer_payload = {
+        "name": layer_name,
+        "active": True,
+        "group": False,
+    }
+    
+    create_response = _api_post_json(config, f"/shot/{shot_uuid}/layers/new", layer_payload)
+    
+    # Find the newly created layer index
+    layers_after = _get_shot_layers_from_config(config, shot_uuid)
+    new_layer_idx = None
+    for idx in range(len(layers_after) - 1, -1, -1):
+        if str(getattr(layers_after[idx], "name", "")).strip() == layer_name:
+            new_layer_idx = idx
+            break
+    
+    if new_layer_idx is None and layers_after:
+        new_layer_idx = len(layers_after) - 1
+    
+    if new_layer_idx is None:
+        raise RuntimeError("Could not find newly created mask layer")
+    
+    _print_step(f"Created mask layer '{layer_name}' at index {new_layer_idx}")
+    return new_layer_idx
+
+
+def _configure_mask_layer_for_matte_render(config, shot_uuid, layer_idx):
+    """Configure the mask layer for proper matte rendering.
+    
+    Human workflow:
+    - Set brightness to 0 (color-b.l=0)
+    - Canvas invert on (canvas.alpha=0 in REST API)
+    - Matte blend mode = Subtract (so mask area becomes transparent in alpha)
+    
+    All settings are applied in a single PUT to ensure atomicity.
+    """
+    # Single PUT with all layer properties
+    layer_payload = {
+        "name": "MatAnyone_Mask",
+        "active": True,
+        "group": False,
+        "colorgrade": {
+            "offset":     {"r": 0, "g": 0, "b": 0, "m": 0},
+            "pre_gain":   {"r": 0, "g": 0, "b": 0, "m": 0},
+            "color-a":    {"h": 0, "l": 0, "s": 0},
+            "lift":       {"r": 0, "g": 0, "b": 0, "m": 0},
+            "gamma":      {"r": 1, "g": 1, "b": 1, "m": 1},
+            "gain":       {"r": 0, "g": 0, "b": 0, "m": 0},
+            "color-b":    {"h": 0, "l": 0, "s": 0},       # brightness=0
+            "tone":       {"c": 0, "i": 0, "s": 0},
+            "temperature": {"k": 0, "t": 0},
+            "aperature":  {"c": 0, "d": 0},
+            "noise": 0,
+            "channel_invert": False,
+            "channel_remap": "^RRRA$",
+            "soft_clip_high": {"r": 0, "g": 0, "b": 0},
+            "soft_clip_low":  {"r": 0, "g": 0, "b": 0},
+            "clip_high":      {"r": 0, "g": 0, "b": 0},
+            "clip_low":       {"r": 0, "g": 0, "b": 0},
+            "lut": "",
+        },
+        "canvas": {
+            "alpha": 0,           # Canvas invert (alpha=0 = inverted)
+            "softness": 0,
+            "xform": {
+                "pivot": {"x": 0, "y": 0, "z": 0},
+                "rotate": {"x": 0, "y": 0, "z": 0},
+                "scale": {"x": 1, "y": 1, "z": 1},
+                "translate": {"x": 0, "y": 0, "z": 0},
+            },
+        },
+        "matte": {
+            "blend_mode": "Subtract",
+            "blur": 0,
+            "blur_angle": 0,
+            "blur_dir_active": False,
+            "channel_mask": {"R": True, "G": True, "B": True, "A": True},
+            "map": "Projected",
+            "slip": 0,
+            "orientation": {"rot": 0, "sx": 1, "sy": 1, "tx": 0, "ty": 0},
+            "warp": "None",
+            "warp_blur_filter": 0,
+            "warp_equi_dist": 0,
+        },
+    }
+    try:
+        _api_put_json(config, f"/shot/{shot_uuid}/layers/{layer_idx}", layer_payload)
+        _print_step(
+            f"Layer {layer_idx} configured: color-b.l=0, canvas.alpha=0 (invert), "
+            f"matte=Subtract, channel_remap=RRRA"
+        )
+    except Exception as e:
+        _print_step(f"Warning: could not configure layer {layer_idx}: {e}")
+
+    # Clear any fill on this layer (it should carry matte only)
+    try:
+        requests.delete(
+            f"{config.host}/shot/{shot_uuid}/layers/{layer_idx}/fill",
+            timeout=20,
+        ).raise_for_status()
+    except Exception:
+        pass
+
+
+def _get_shot_layers_from_config(config, shot_uuid):
+    """Get shot layers using raw HTTP (for when we don't have projects_api)."""
+    response = requests.get(f"{config.host}/shot/{shot_uuid}/layers", timeout=20)
+    response.raise_for_status()
+    data = response.json()
+    return list(getattr(data, "layers", []) or data.get("layers", []))
+
+
+def _configure_output_for_rgba_tiff(config, output_uuid):
+    """Configure the output node to render 16-bit TIFF RGBA.
+    
+    This is critical: the alpha channel in the rendered TIFF carries the
+    actual matte shape from the Subtract blend mode.
+    
+    ShotDataOutput fields:
+    - outputpath: str (output folder)
+    - filespec: str (file specification mask)
+    - format: int (format bitmask)
+    - components: int (3=RGB, 4=RGBA)
+    - extention: str (file extension)
+    """
+    endpoint = f"{config.host}/constructs/current/outputs/{output_uuid}"
+    response = requests.get(endpoint, timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+    
+    output_block = payload.setdefault("output", {})
+    
+    # Save original format for restoration later
+    original_format = {
+        "format": output_block.get("format"),
+        "components": output_block.get("components"),
+        "extention": output_block.get("extention"),
+    }
+    
+    # Set RGBA (4 components) TIFF output
+    # components=4 ensures RGBA so the alpha channel carries the matte
+    # extention enum values: "tif" "dpx" "cin" "jpg" "tga" "j2c" "png" "exr" (no dot)
+    output_block["components"] = 4        # RGBA
+    output_block["extention"] = "tif"     # TIFF format (no dot prefix - API enum)
+    
+    update_response = requests.put(endpoint, json=payload, timeout=20)
+    update_response.raise_for_status()
+    
+    _print_step(f"Output node configured: RGBA TIFF (components=4, ext=tif)")
+    return original_format
+
+
+def _restore_output_format(config, output_uuid, original_format):
+    """Restore the output node to its original format settings."""
+    endpoint = f"{config.host}/constructs/current/outputs/{output_uuid}"
+    response = requests.get(endpoint, timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+    
+    output_block = payload.setdefault("output", {})
+    
+    if original_format.get("format") is not None:
+        output_block["format"] = original_format["format"]
+    if original_format.get("components") is not None:
+        output_block["components"] = original_format["components"]
+    if original_format.get("extention") is not None:
+        output_block["extention"] = original_format["extention"]
+    
+    requests.put(endpoint, json=payload, timeout=20)
+    _print_step("Output node format restored to original settings")
+
+
+def _extract_alpha_from_rgba(source_path, target_path):
+    """Extract the alpha channel from an RGBA TIFF image.
+    
+    In the rendered RGBA TIFF with the mask layer using Subtract blend:
+    - The ALPHA channel carries the matte shape
+    - Painted (white mask) areas: alpha = 0 (transparent)
+    - Unpainted areas: alpha = 1-255 (opaque)
+    
+    We invert the alpha to get the standard matte convention:
+    - White (255) = foreground (the masked/painted area)
+    - Black (0) = background
+    
+    Fallback: if alpha is all white (no transparency detected), try
+    the red channel or luminance instead.
+    """
+    with Image.open(source_path) as image:
+        _print_step(f"Rendered image mode: {image.mode}, size: {image.size}")
+        
+        # Ensure we have an alpha channel
+        if image.mode == "RGBA":
+            r, g, b, a = image.split()
+            r_min, r_max = r.getextrema()
+            g_min, g_max = g.getextrema()
+            b_min, b_max = b.getextrema()
+            a_min, a_max = a.getextrema()
+            _print_step(f"Channel ranges: R=({r_min},{r_max}) G=({g_min},{g_max}) B=({b_min},{b_max}) A=({a_min},{a_max})")
+            
+            alpha_min, alpha_max = a_min, a_max
+            
+            if alpha_min == alpha_max == 255:
+                # Alpha is all white (no transparency) - the Subtract blend
+                # may not have produced meaningful alpha. Try fallback approaches.
+                _print_step("Alpha is fully opaque (255). Trying red channel fallback...")
+                red_min, red_max = r.getextrema()
+                _print_step(f"Red channel range: min={red_min}, max={red_max}")
+                
+                if red_min != red_max:
+                    # Red channel has variation - use it as the matte
+                    from PIL import ImageOps
+                    matte = ImageOps.invert(r)
+                    matte.save(target_path)
+                    _print_step(f"Used inverted red channel as matte: {target_path}")
+                    return
+                
+                # Try luminance
+                _print_step("Trying luminance fallback...")
+                gray = image.convert("L")
+                gray_min, gray_max = gray.getextrema()
+                _print_step(f"Luminance range: min={gray_min}, max={gray_max}")
+                gray.save(target_path)
+                _print_step(f"Used luminance as matte: {target_path}")
+                return
+            
+            # Alpha has variation - use it (this is the expected path)
+            from PIL import ImageOps
+            matte = ImageOps.invert(a)
+            matte.save(target_path)
+            _print_step(f"Alpha channel extracted and inverted: {target_path}")
+            return
+        
+        # No alpha channel at all - try luminance
+        _print_step(f"No alpha channel (mode={image.mode}). Using luminance fallback...")
+        gray = image.convert("L")
+        gray.save(target_path)
+        _print_step(f"Used luminance as matte: {target_path}")
+
+
+def _delete_layer(config, shot_uuid, layer_idx):
+    """Delete a layer from the shot."""
+    try:
+        requests.delete(
+            f"{config.host}/shot/{shot_uuid}/layers/{layer_idx}",
+            timeout=20,
+        ).raise_for_status()
+        _print_step(f"Deleted layer {layer_idx}")
+    except Exception as e:
+        _print_step(f"Warning: could not delete layer {layer_idx}: {e}")
+
+
+# =========================================================================
+# --- UPDATED PASS B: CORRECT MATTE EXTRACTION ---------------------------
+# =========================================================================
+
+def _render_mask_pass_correct(config, app_api, projects_api, shot_uuid, output_uuid, mask_render_dir, cache_dir):
+    """Render the mask using the correct human workflow:
+    
+    1. Create a dedicated mask layer (MatAnyone_Mask)
+    2. Configure mask layer: brightness=0 (color-b.l=0), matte blend=Subtract
+    3. Configure output node: RGBA TIFF
+    4. Render ONE frame with ALL layers active (the Subtract blend needs
+       the source plate below it to create meaningful alpha transparency)
+    5. Extract alpha channel from the rendered RGBA TIFF
+    6. Clean up: delete mask layer, restore output format
+    
+    Returns: path to the extracted matte PNG
+    """
+    mask_path = os.path.join(cache_dir, "mask.png")
+    
+    # Get current output format for restoration
+    endpoint = f"{config.host}/constructs/current/outputs/{output_uuid}"
+    response = requests.get(endpoint, timeout=20)
+    response.raise_for_status()
+    original_output = response.json()
+    original_format = {
+        "format": original_output.get("output", {}).get("format"),
+        "components": original_output.get("output", {}).get("components"),
+        "extention": original_output.get("output", {}).get("extention"),
+    }
+    
+    new_layer_idx = None
+    try:
+        # Step 1: Create dedicated mask layer
+        _print_step("Creating dedicated mask layer...")
+        new_layer_idx = _create_dedicated_mask_layer(config, shot_uuid, "MatAnyone_Mask")
+        
+        # Step 2: Configure the mask layer (brightness=0, matte=Subtract)
+        # NOTE: We do NOT disable other layers. The Subtract blend mode needs
+        # the source plate (and other layers) below it to create meaningful
+        # alpha transparency. The mask's white (painted) areas SUBTRACT from
+        # the composite alpha, making those areas transparent.
+        _print_step("Configuring mask layer (color-b.l=0, matte=Subtract)...")
+        _configure_mask_layer_for_matte_render(config, shot_uuid, new_layer_idx)
+        
+        # Step 3: Configure output for RGBA TIFF
+        _print_step("Configuring output for RGBA TIFF (components=4)...")
+        _configure_output_for_rgba_tiff(config, output_uuid)
+        
+        # Step 4: Render one frame with ALL layers active
+        _print_step("Rendering mask frame (full composite, RGBA TIFF)...")
+        configure_current_output(config, output_uuid, mask_render_dir, single_frame=True)
+        mask_queue_item, mask_render_started_at = _render_output_pass(
+            app_api, output_uuid, expected_min_files=1
+        )
+        
+        mask_source_dir = _render_item_path(mask_queue_item) or mask_render_dir
+        
+        # Find the rendered file
+        generated_files = recent_render_files(
+            [mask_render_dir, mask_source_dir],
+            mask_render_started_at,
+            (".tif", ".tiff", ".png"),
+        )
+        if not generated_files:
+            generated_files = recent_render_files(
+                [mask_render_dir, mask_source_dir],
+                0,
+                (".tif", ".tiff", ".png"),
+            )
+        if not generated_files:
+            raise RuntimeError("Mask render produced no output files")
+        
+        rendered_file = generated_files[0]
+        _print_step(f"Mask rendered: {rendered_file}")
+        
+        # Step 5: Extract alpha channel from RGBA TIFF
+        _print_step("Extracting alpha channel from RGBA render...")
+        _extract_alpha_from_rgba(rendered_file, mask_path)
+        
+        _print_step(f"Mask extraction complete: {mask_path}")
+        
+    finally:
+        # Step 6: Clean up - restore everything
+        _print_step("Restoring layer states and output format...")
+        
+        # Delete the mask layer we created
+        if new_layer_idx is not None:
+            _delete_layer(config, shot_uuid, new_layer_idx)
+        
+        # Restore output format
+        _restore_output_format(config, output_uuid, original_format)
+        
+        _print_step("Cleanup complete")
+    
+    return mask_path
+
+
+# =========================================================================
 # --- STEP 2: VRAM LIMIT CALCULATOR & PRE-FLIGHT CHECKS ------------------
 # =========================================================================
 def get_safe_batch_limit():
@@ -997,8 +1385,6 @@ def run_option1_pipeline(args):
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(final_alpha_dir, exist_ok=True)
     os.makedirs(mask_render_dir, exist_ok=True)
-    mask_path = os.path.join(workspace_dir, "mask.png")
-
 
     _print_step("Resolving construct output node")
     try:
@@ -1006,6 +1392,9 @@ def run_option1_pipeline(args):
     except Exception as e:
         raise RuntimeError(f"Failed to resolve/create a construct output node: {e}")
 
+    # =========================================================================
+    # PASS A: Render clean plates (all layers except mask layer disabled)
+    # =========================================================================
     layers = _get_shot_layers(projects_api, shot_uuid)
     target_layer_idx = _pick_mask_layer(layers, args.mask_layer_name, args.mask_layer_fallback)
     if target_layer_idx is None:
@@ -1034,33 +1423,22 @@ def run_option1_pipeline(args):
     finally:
         _set_layer_active(config, shot_uuid, target_layer_idx, True)
 
-    _print_step(f"PASS B: rendering mask from layer index {target_layer_idx}")
-    _print_step("Rendering mask frame 1/1")
+    # =========================================================================
+    # PASS B: Render mask using RGBA alpha workflow
+    # =========================================================================
+    _print_step("PASS B: rendering mask using RGBA alpha workflow")
+    _print_step("Creating dedicated mask layer, configuring subtract blend, rendering RGBA TIFF...")
     try:
-        _set_layer_active(config, shot_uuid, target_layer_idx, True)
-        configure_current_output(config, output_uuid, mask_render_dir, single_frame=True)
-        mask_queue_item, mask_render_started_at = _render_output_pass(app_api, output_uuid, expected_min_files=1)
-
-        mask_source_dir = _render_item_path(mask_queue_item) or mask_render_dir
-
-        generated_mask_files = recent_render_files(
-            [mask_render_dir, mask_source_dir],
-            mask_render_started_at,
-            (".tif", ".tiff", ".png"),
+        mask_path = _render_mask_pass_correct(
+            config, app_api, projects_api, shot_uuid, output_uuid, mask_render_dir, workspace_dir
         )
-        if not generated_mask_files:
-            generated_mask_files = recent_render_files(
-                [mask_render_dir, mask_source_dir],
-                0,
-                (".tif", ".tiff", ".png"),
-            )
-        if not generated_mask_files:
-            raise RuntimeError("Mask pass finished but no image file was produced")
-        _to_binary_mask(generated_mask_files[0], mask_path)
         _print_step(f"Mask pass complete: {mask_path}")
     except Exception as e:
         raise RuntimeError(f"Failed during Pass B mask extraction: {e}")
 
+    # =========================================================================
+    # MatAnyone2 Inference
+    # =========================================================================
     _print_step("Running MatAnyone2 with VRAM-based chunking")
     all_frames = recent_render_files(
         [render_source_dir, export_dir],
@@ -1191,6 +1569,9 @@ def run_option1_pipeline(args):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    # =========================================================================
+    # Import matte back into SCRATCH
+    # =========================================================================
     _print_step("Attempting to load generated matte back into SCRATCH")
     try:
         selected = projects_api.get_construct_current_selected_shots(level="ALL")
@@ -1229,6 +1610,7 @@ def run_option1_pipeline(args):
         pass
 
     _print_step("Pipeline execution completed")
+
 
 if __name__ == "__main__":
     argument_parser = build_argument_parser()
