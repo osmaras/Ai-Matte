@@ -1393,7 +1393,7 @@ def run_option1_pipeline(args):
         raise RuntimeError(f"Failed to resolve/create a construct output node: {e}")
 
     # =========================================================================
-    # PASS A: Render clean plates (all layers except mask layer disabled)
+    # PASS A: Render clean plates (ALL layers disabled for raw source)
     # =========================================================================
     layers = _get_shot_layers(projects_api, shot_uuid)
     target_layer_idx = _pick_mask_layer(layers, args.mask_layer_name, args.mask_layer_fallback)
@@ -1408,9 +1408,17 @@ def run_option1_pipeline(args):
     if expected_plate_count > 0:
         _print_step(f"PASS A: rendering clean plates 1/{expected_plate_count}..{expected_plate_count}/{expected_plate_count}")
     else:
-        _print_step("PASS A: rendering clean plate sequence with mask layer disabled")
+        _print_step("PASS A: rendering clean plate sequence with ALL layers disabled")
     try:
-        _set_layer_active(config, shot_uuid, target_layer_idx, False)
+        # Disable ALL layers so the clean plate is the raw source footage
+        layer_states_before_pass_a = _save_layer_states(layers)
+        for idx in range(len(layers)):
+            try:
+                _set_layer_active(config, shot_uuid, idx, False)
+            except Exception:
+                pass
+        _print_step(f"Disabled all {len(layers)} layers for clean plate render")
+
         configure_current_output(config, output_uuid, export_dir, single_frame=False)
         queue_item, render_started_at = _render_output_pass(
             app_api,
@@ -1421,7 +1429,9 @@ def run_option1_pipeline(args):
     except Exception as e:
         raise RuntimeError(f"Failed during Pass A clean plate render: {e}")
     finally:
-        _set_layer_active(config, shot_uuid, target_layer_idx, True)
+        # Restore all layers to their original states
+        _restore_all_layers(config, shot_uuid, layer_states_before_pass_a)
+        _print_step("Restored all layer states after clean plate render")
 
     # =========================================================================
     # PASS B: Render mask using RGBA alpha workflow
