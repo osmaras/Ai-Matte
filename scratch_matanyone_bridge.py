@@ -1,4 +1,4 @@
-# /// script
+﻿# /// script
 # requires-python = ">=3.10"
 # dependencies = [
 #     "requests>=2.31.0",
@@ -7,6 +7,9 @@
 #     "tqdm>=4.66.0",
 #     "torch>=2.2.0",
 #     "torchvision>=0.17.0",
+#     "gradio>=4.26.0",
+#     "opencv-python-headless>=4.8.0",
+#     "sam2 @ git+https://github.com/facebookresearch/sam2.git",
 #     "matanyone2 @ git+https://github.com/osmaras/MatAnyone2.git",
 #     "assimilate_client @ git+https://github.com/Assimilate-Inc/Assimilate-REST.git",
 # ]
@@ -15,6 +18,7 @@
 import argparse
 import contextlib
 import os
+import sys
 import time
 import torch
 import shutil
@@ -99,6 +103,22 @@ def build_argument_parser():
         "--require-cuda",
         action="store_true",
         help="Fail if CUDA GPU inference is not available.",
+    )
+    parser.add_argument(
+        "--skip-sam",
+        action="store_true",
+        help="Skip the SAM2 interactive editor and reuse an existing mask.png if present.",
+    )
+    parser.add_argument(
+        "--sam-port",
+        type=int,
+        default=7860,
+        help="Local port for the Gradio SAM2 editor (default: 7860).",
+    )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Do not open the browser automatically when launching the SAM2 editor.",
     )
     return parser
 
@@ -1433,23 +1453,8 @@ def run_option1_pipeline(args):
         _restore_all_layers(config, shot_uuid, layer_states_before_pass_a)
         _print_step("Restored all layer states after clean plate render")
 
-    # =========================================================================
-    # PASS B: Render mask using RGBA alpha workflow
-    # =========================================================================
-    _print_step("PASS B: rendering mask using RGBA alpha workflow")
-    _print_step("Creating dedicated mask layer, configuring subtract blend, rendering RGBA TIFF...")
-    try:
-        mask_path = _render_mask_pass_correct(
-            config, app_api, projects_api, shot_uuid, output_uuid, mask_render_dir, workspace_dir
-        )
-        _print_step(f"Mask pass complete: {mask_path}")
-    except Exception as e:
-        raise RuntimeError(f"Failed during Pass B mask extraction: {e}")
-
-    # =========================================================================
-    # MatAnyone2 Inference
-    # =========================================================================
-    _print_step("Running MatAnyone2 with VRAM-based chunking")
+    # ── Collect clean plate frames (needed for both the SAM2 editor and MatAnyone) ──
+    _print_step("Collecting rendered clean plate frames")
     all_frames = recent_render_files(
         [render_source_dir, export_dir],
         render_started_at,
@@ -1461,13 +1466,42 @@ def run_option1_pipeline(args):
             0,
             (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".dpx"),
         )
-
     total_frames = len(all_frames)
     if total_frames == 0:
         raise RuntimeError(f"No clean plate frames found in: {export_dir}")
-
     frames_per_chunk = get_safe_batch_limit()
     device = get_inference_device(require_cuda=args.require_cuda)
+
+    # ── PASS B: Interactive SAM2 mask editor ────────────────────────────────
+    if args.skip_sam and os.path.isfile(mask_path):
+        _print_step(f"PASS B skipped (--skip-sam): reusing existing mask → {mask_path}")
+    else:
+        _print_step("PASS B: Launching SAM2 interactive mask editor")
+        _print_step(f"  Source frame : {all_frames[0]}")
+        _print_step(f"  Mask output  : {mask_path}")
+        _print_step("A browser window will open. Click on subjects, then click 'Save & Continue'.")
+
+        _editor_dir = os.path.dirname(os.path.abspath(__file__))
+        if _editor_dir not in sys.path:
+            sys.path.insert(0, _editor_dir)
+        from sam_mask_editor import launch_mask_editor  # noqa: PLC0415
+
+        launch_mask_editor(
+            frame_path=all_frames[0],
+            output_mask_path=mask_path,
+            device=device,
+            port=args.sam_port,
+            open_browser=not args.no_browser,
+        )
+
+        if not os.path.isfile(mask_path):
+            raise RuntimeError(
+                "The SAM2 editor closed without saving a mask. "
+                "Re-run or use --skip-sam with an existing mask.png."
+            )
+        _print_step(f"PASS B complete: mask saved → {mask_path}")
+
+    _print_step("Running MatAnyone2 with VRAM-based chunking")
     _print_step(f"MatAnyone inference device: {device}; chunk size: {frames_per_chunk}; overlap: {args.chunk_overlap}")
 
     _print_step("Loading MatAnyone2 weights")
