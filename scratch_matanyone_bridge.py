@@ -1,4 +1,4 @@
-﻿# /// script
+# /// script
 # requires-python = ">=3.10"
 # dependencies = [
 #     "requests>=2.31.0",
@@ -9,7 +9,7 @@
 #     "torchvision>=0.17.0",
 #     "gradio>=4.26.0",
 #     "opencv-python-headless>=4.8.0",
-#     "sam2 @ git+https://github.com/facebookresearch/sam2.git",
+#     "sam-2 @ git+https://github.com/facebookresearch/sam2.git",
 #     "matanyone2 @ git+https://github.com/osmaras/MatAnyone2.git",
 #     "assimilate_client @ git+https://github.com/Assimilate-Inc/Assimilate-REST.git",
 # ]
@@ -1473,6 +1473,7 @@ def run_option1_pipeline(args):
     device = get_inference_device(require_cuda=args.require_cuda)
 
     # ── PASS B: Interactive SAM2 mask editor ────────────────────────────────
+    mask_path = os.path.join(args.cache_dir, "mask.png")
     if args.skip_sam and os.path.isfile(mask_path):
         _print_step(f"PASS B skipped (--skip-sam): reusing existing mask → {mask_path}")
     else:

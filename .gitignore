@@ -3,5 +3,6 @@ __pycache__/
 .uv-cache/
 .uv-tmp/
 runtime-cache/
+launcher.bat
 *.pyc
 assimilate_rest_api.yaml

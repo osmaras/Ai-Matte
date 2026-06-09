@@ -127,6 +127,7 @@ set "TMP=$tmpDir"
 set "TEMP=$tmpDir"
 
 "$uvPath" run ^
+    --verbose ^
     --with torch==2.5.1+cu124 ^
     --with torchvision==0.20.1+cu124 ^
     --default-index https://pypi.org/simple ^

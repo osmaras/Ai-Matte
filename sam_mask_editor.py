@@ -15,6 +15,7 @@ import traceback
 from typing import Any
 
 import numpy as np
+import gradio as gr
 from PIL import Image
 
 # ---------------------------------------------------------------------------
@@ -116,12 +117,14 @@ def _predict_for_current(state: dict) -> dict:
 # Gradio handler functions
 # ---------------------------------------------------------------------------
 
-def on_click(evt, state, point_mode, obj_key, erode_px, dilate_px):
+def on_click(evt: gr.SelectData, state, point_mode, obj_key, erode_px, dilate_px):
     """Handle a user click on the image."""
     if evt is None or _image_np is None:
         return None, state, "No image loaded."
 
-    idx = evt.index
+    idx = getattr(evt, "index", None)
+    if idx is None and isinstance(evt, dict):
+        idx = evt.get("index")
     if not (isinstance(idx, (list, tuple)) and len(idx) >= 2):
         return None, state, "Could not read click coordinates."
 
@@ -292,7 +295,7 @@ def launch_mask_editor(
     }
 
     # ── Build Gradio layout ─────────────────────────────────────────────────
-    with gr.Blocks(title="SAM2 Mask Editor", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="SAM2 Mask Editor") as demo:
 
         gr.Markdown("# 🎭 SAM2 Interactive Mask Editor")
         gr.Markdown(
@@ -423,6 +426,7 @@ def launch_mask_editor(
         inbrowser=open_browser,
         prevent_thread_lock=True,
         quiet=False,
+        theme=gr.themes.Soft(),
     )
 
     _done_event.wait()
