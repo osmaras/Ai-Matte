@@ -29,6 +29,7 @@ _object_masks:  dict[str, np.ndarray] = {}  # obj_id → (H, W) bool
 _output_path:   str | None         = None
 _done_event:    threading.Event | None = None
 _device:        str                = "cuda"
+_hide_points:   bool               = False
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +83,7 @@ def _build_display(state: dict, erode_px: int, dilate_px: int) -> np.ndarray:
     obj    = state["objects"].get(cur_id, {})
     pts    = obj.get("points", [])
     lbls   = obj.get("labels", [])
-    if pts:
+    if pts and not _hide_points:
         display = draw_interaction_points(display, pts, lbls)
 
     return display
@@ -210,6 +211,12 @@ def on_redo(state, obj_key, erode_px, dilate_px):
             state = _predict_for_current(state)
             return _build_display(state, int(erode_px), int(dilate_px)), state, f"Redo on Object {target}"
     return _build_display(state, int(erode_px), int(dilate_px)), state, "Nothing to redo"
+
+
+def on_toggle_points(hide, state, erode_px, dilate_px):
+    global _hide_points
+    _hide_points = hide
+    return _build_display(state, int(erode_px), int(dilate_px))
 
 
 def on_erode_dilate(state, erode_px, dilate_px):
@@ -418,6 +425,7 @@ def launch_mask_editor(
                         clear_btn = gr.Button("🗑 Clear", size="sm")
                         undo_btn  = gr.Button("↩ Undo", size="sm")
                         redo_btn  = gr.Button("↪ Redo", size="sm")
+                    hide_pts = gr.Checkbox(label="Hide points", value=False)
                     reset_btn = gr.Button("🔄 Reset All", variant="stop", size="sm")
 
                 # Save
@@ -477,6 +485,11 @@ def launch_mask_editor(
             fn=on_redo,
             inputs=[state, obj_dd, erode_sl, dilate_sl],
             outputs=[img_out, state, status],
+        )
+        hide_pts.change(
+            fn=on_toggle_points,
+            inputs=[hide_pts, state, erode_sl, dilate_sl],
+            outputs=[img_out],
         )
         reset_btn.click(
             fn=on_reset_all,
