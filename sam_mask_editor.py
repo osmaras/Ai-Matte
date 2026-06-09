@@ -138,6 +138,7 @@ def on_click(evt: gr.SelectData, state, point_mode, obj_key, erode_px, dilate_px
 
     state["objects"][cur_id]["points"].append([x, y])
     state["objects"][cur_id]["labels"].append(label)
+    state["redo_stack"] = []  # clear redo on new action
     state = _predict_for_current(state)
 
     display  = _build_display(state, int(erode_px), int(dilate_px))
@@ -189,10 +190,26 @@ def on_undo(state, obj_key, erode_px, dilate_px):
     cid = _obj_id(obj_key)
     obj = state["objects"].get(cid, {})
     if obj.get("points"):
-        obj["points"].pop()
-        obj["labels"].pop()
+        pt = obj["points"].pop()
+        lb = obj["labels"].pop()
+        state.setdefault("redo_stack", []).append({"obj": cid, "point": pt, "label": lb})
         state = _predict_for_current(state)
     return _build_display(state, int(erode_px), int(dilate_px)), state, f"Undid last point on Object {cid}"
+
+
+def on_redo(state, obj_key, erode_px, dilate_px):
+    cid = _obj_id(obj_key)
+    stack = state.get("redo_stack", [])
+    if stack:
+        entry = stack.pop()
+        target = entry["obj"]
+        if target in state["objects"]:
+            state["objects"][target]["points"].append(entry["point"])
+            state["objects"][target]["labels"].append(entry["label"])
+            state["current_id"] = target
+            state = _predict_for_current(state)
+            return _build_display(state, int(erode_px), int(dilate_px)), state, f"Redo on Object {target}"
+    return _build_display(state, int(erode_px), int(dilate_px)), state, "Nothing to redo"
 
 
 def on_erode_dilate(state, erode_px, dilate_px):
@@ -207,6 +224,7 @@ def on_reset_all(state, erode_px, dilate_px):
         "objects":    {"1": {"points": [], "labels": [], "color_idx": 0}},
         "current_id": "1",
         "next_id":    2,
+        "redo_stack": [],
     }
     if _predictor is not None:
         try:
@@ -292,77 +310,126 @@ def launch_mask_editor(
         "objects":    {"1": {"points": [], "labels": [], "color_idx": 0}},
         "current_id": "1",
         "next_id":    2,
+        "redo_stack": [],
     }
 
     # ── Build Gradio layout ─────────────────────────────────────────────────
-    with gr.Blocks(title="SAM2 Mask Editor") as demo:
+    dark = gr.themes.Base(
+        primary_hue="blue", neutral_hue="slate",
+    ).set(
+        body_background_fill="*neutral_950",
+        body_background_fill_dark="*neutral_950",
+        block_background_fill="*neutral_900",
+        block_background_fill_dark="*neutral_900",
+        block_label_text_color="*neutral_300",
+        block_label_text_color_dark="*neutral_300",
+        block_title_text_color="*neutral_200",
+        block_title_text_color_dark="*neutral_200",
+        input_background_fill="*neutral_800",
+        input_background_fill_dark="*neutral_800",
+        input_border_color="*neutral_700",
+        input_border_color_dark="*neutral_700",
+        button_primary_background_fill="*primary_600",
+        button_primary_background_fill_dark="*primary_600",
+        button_secondary_background_fill="*neutral_700",
+        button_secondary_background_fill_dark="*neutral_700",
+        border_color_primary="*neutral_700",
+        border_color_primary_dark="*neutral_700",
+    )
 
-        gr.Markdown("# 🎭 SAM2 Interactive Mask Editor")
-        gr.Markdown(
-            f"**Frame:** `{os.path.basename(frame_path)}` &nbsp;&nbsp;({W}×{H})  \n"
-            "**Click** anywhere on the image to place SAM2 segmentation points.  "
-            "Toggle **Positive / Negative** to add or subtract regions.  "
-            "Use **+ Add Object** for multi-subject shots.  "
-            "Click **💾 Save & Continue** when you're happy with the mask."
-        )
+    css = """
+    /* Force horizontal row layout */
+    .main-row { display: flex !important; flex-direction: row !important; height: 100vh !important; }
+    .main-row > .gradio-column { height: 100% !important; }
+    /* Sidebar */
+    .sam-sidebar { gap: 8px !important; padding: 8px !important; min-width: 240px !important; max-width: 260px !important;
+                   overflow-y: auto !important; flex: 0 0 250px !important; }
+    .sam-sidebar .gradio-group { border: 1px solid #3a3a3a !important; padding: 8px !important; margin: 0 !important; border-radius: 6px !important; }
+    .sam-sidebar label { font-size: 11px !important; margin-bottom: 2px !important; }
+    .sam-sidebar input[type=range] { height: 16px !important; }
+    .sam-status { padding: 4px 8px !important; }
+    .sam-status textarea { font-family: 'Consolas', 'SF Mono', monospace !important; font-size: 11px !important;
+                           padding: 4px 8px !important; min-height: 20px !important; max-height: 24px !important; }
+    .sam-save-btn { min-height: 36px !important; }
+    header, footer { display: none !important; }
+    .gradio-container { max-width: 100% !important; padding: 0 !important; height: 100vh !important; overflow: hidden !important; }
+    /* Maximize image viewer — 80% viewport */
+    .sam-image-wrap { flex: 9 1 0 !important; min-height: 0 !important; max-width: 90vw !important; }
+    .sam-image-wrap .image-container,
+    .sam-image-wrap .preview-container { height: calc(90vh - 20px) !important; }
+    .sam-image-wrap img { object-fit: contain !important; max-height: calc(90vh - 30px) !important; }
+    /* Hide upload icons and fullscreen/remove buttons */
+    .sam-image-wrap .toolbar,
+    .sam-image-wrap .upload-button,
+    .sam-image-wrap button[aria-label="Upload"],
+    .sam-image-wrap button[aria-label="Camera"],
+    .sam-image-wrap button[aria-label="Paste from clipboard"],
+    .sam-image-wrap .source-selection,
+    .sam-image-wrap .image-buttons,
+    .sam-image-wrap button[aria-label="Remove"],
+    .sam-image-wrap button[aria-label="Fullscreen"] { display: none !important; }
+    """
 
-        state      = gr.State(init_state)
-        dev_state  = gr.State(device)          # read-only, passed to handlers that need it
+    with gr.Blocks(title="SAM2 Mask Editor", fill_width=True) as demo:
 
-        with gr.Row():
-            # ── Left: image viewer ────────────────────────────────────────
-            with gr.Column(scale=3):
+        state     = gr.State(init_state)
+        dev_state = gr.State(device)
+
+        with gr.Row(equal_height=False, elem_classes="main-row"):
+            # ── Left: image viewer (maximized) ───────────────────────────────
+            with gr.Column(scale=1, elem_classes="sam-image-wrap"):
                 img_out = gr.Image(
                     value=_image_np.copy(),
-                    label="Click to place SAM2 points",
+                    show_label=False,
                     interactive=True,
                     type="numpy",
-                    height=min(H, 720),
+                    sources=[],
                 )
 
-            # ── Right: controls panel ─────────────────────────────────────
-            with gr.Column(scale=1, min_width=270):
+            # ── Right: vertical sidebar ──────────────────────────────────────
+            with gr.Column(scale=0, elem_classes="sam-sidebar"):
+                # Mode
+                with gr.Group():
+                    point_mode = gr.Radio(
+                        choices=["➕ Positive", "➖ Negative"],
+                        value="➕ Positive",
+                        label="Mode",
+                        container=False,
+                    )
 
-                gr.Markdown("### 🖱 Click Mode")
-                point_mode = gr.Radio(
-                    choices=["✅ Positive (add to mask)", "❌ Negative (remove from mask)"],
-                    value="✅ Positive (add to mask)",
-                    label="",
-                    container=False,
-                )
+                # Objects
+                with gr.Group():
+                    obj_dd = gr.Dropdown(
+                        choices=["Object 1"], value="Object 1",
+                        label="Object", interactive=True,
+                    )
+                    with gr.Row():
+                        add_obj_btn = gr.Button("＋ Add", size="sm", scale=1)
+                        rem_obj_btn = gr.Button("✕ Remove", size="sm", variant="secondary", scale=1)
 
-                gr.Markdown("### 🗂 Objects")
-                gr.Markdown(
-                    "<small>Each object gets its own colour overlay.  "
-                    "Combine overlapping objects freely — they merge on save.</small>"
-                )
-                obj_dd = gr.Dropdown(
-                    choices=["Object 1"],
-                    value="Object 1",
-                    label="Active object",
-                    interactive=True,
-                )
-                with gr.Row():
-                    add_obj_btn = gr.Button("＋ Add Object", size="sm")
-                    rem_obj_btn = gr.Button("✕ Remove",     size="sm", variant="secondary")
+                # Edge refinement
+                with gr.Group():
+                    erode_sl  = gr.Slider(0, 30, value=0, step=1, label="Erode (px)")
+                    dilate_sl = gr.Slider(0, 30, value=0, step=1, label="Dilate (px)")
 
-                gr.Markdown("### 🔧 Edge Refinement")
-                erode_sl  = gr.Slider(0, 30, value=0, step=1, label="Erode edges (px)")
-                dilate_sl = gr.Slider(0, 30, value=0, step=1, label="Dilate edges (px)")
+                # History
+                with gr.Group():
+                    with gr.Row():
+                        clear_btn = gr.Button("🗑 Clear", size="sm")
+                        undo_btn  = gr.Button("↩ Undo", size="sm")
+                        redo_btn  = gr.Button("↪ Redo", size="sm")
+                    reset_btn = gr.Button("🔄 Reset All", variant="stop", size="sm")
 
-                gr.Markdown("### ↩ History")
-                with gr.Row():
-                    clear_btn = gr.Button("🗑 Clear Points", size="sm")
-                    undo_btn  = gr.Button("↩ Undo Last",    size="sm")
-                reset_btn = gr.Button("🔄 Reset All", variant="stop", size="sm")
+                # Save
+                save_btn = gr.Button("💾 Save & Continue →", variant="primary", size="lg",
+                                     elem_classes="sam-save-btn", min_width=200)
 
-                gr.Markdown("---")
-                save_btn = gr.Button("💾 Save & Continue →", variant="primary", size="lg")
-                status   = gr.Textbox(
-                    label="Status",
-                    value="Click on the image to start segmenting.",
-                    interactive=False,
-                    lines=4,
+                # Status
+                status = gr.Textbox(
+                    value="Click on the image to start.",
+                    interactive=False, show_label=False,
+                    elem_classes="sam-status",
+                    lines=1, max_lines=1,
                 )
 
         # ── Event wiring ─────────────────────────────────────────────────────
@@ -406,6 +473,11 @@ def launch_mask_editor(
             inputs=[state, obj_dd, erode_sl, dilate_sl],
             outputs=[img_out, state, status],
         )
+        redo_btn.click(
+            fn=on_redo,
+            inputs=[state, obj_dd, erode_sl, dilate_sl],
+            outputs=[img_out, state, status],
+        )
         reset_btn.click(
             fn=on_reset_all,
             inputs=[state, erode_sl, dilate_sl],
@@ -426,7 +498,7 @@ def launch_mask_editor(
         inbrowser=open_browser,
         prevent_thread_lock=True,
         quiet=False,
-        theme=gr.themes.Soft(),
+        css=css,
     )
 
     _done_event.wait()
