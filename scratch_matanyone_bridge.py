@@ -1562,11 +1562,11 @@ def run_option1_pipeline(args):
             _print_step(f"Extracting alpha frames from video: {os.path.basename(pha_video)}")
             reader = imageio.get_reader(pha_video)
             for frame_idx, frame in enumerate(reader):
-                frame_name = f"{frame_idx:06d}.png"
+                frame_name = f"{current_start + frame_idx:06d}.png"
                 frame_path = os.path.join(chunk_alpha_src, frame_name)
                 Image.fromarray(frame).convert("L").save(frame_path)
             reader.close()
-            _print_step(f"Extracted {frame_idx + 1} alpha frames")
+            _print_step(f"Extracted {frame_idx + 1} alpha frames to {chunk_alpha_src}")
 
         # Collect extracted or conventionally placed image frames.
         if os.path.isdir(chunk_alpha_src):

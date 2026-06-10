@@ -117,6 +117,8 @@ $requireCudaArg = if ($requireCuda) { " --require-cuda" } else { "" }
 
 $launcherContent = @"
 @echo off
+chcp 65001 >nul
+set "PYTHONUTF8=1"
 setlocal
 cd /d "$projectDir"
 
