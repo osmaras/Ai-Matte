@@ -1467,18 +1467,24 @@ def run_option1_pipeline(args):
     except Exception:
         render_path = None
 
-    # Get construct name for folder structure
+    # Get construct name and slot index for folder structure
     try:
         construct_data = projects_api.get_constructs_current(level="ALL")
         construct_name = getattr(construct_data, "name", None) or "Unknown"
     except Exception:
         construct_name = "Unknown"
+    try:
+        selected = projects_api.get_construct_current_selected_shots(level="ALL")
+        selections = _extract_selected_entries(selected)
+        slot_idx = int(getattr(selections[0], "slot_idx", 0) or 0) if selections else 0
+    except Exception:
+        slot_idx = 0
 
     if render_path and os.path.isdir(render_path):
         shot_label = getattr(shot, "name", None) or shot_uuid[:8]
         final_alpha_dir = os.path.join(
-            render_path, "AiMatte", construct_name, shot_label, "Alphas", shot_label, shot_label
-        ).replace("\\", "/")
+            render_path, "AiMatte", construct_name, f"{slot_idx:03d}_{shot_label}", "Alphas", shot_label
+        )
     else:
         final_alpha_dir = os.path.join(output_dir, "alpha")
     
@@ -1498,17 +1504,26 @@ def run_option1_pipeline(args):
         raise RuntimeError(f"Failed to create MatAnyone output node: {e}")
 
     # Read the actual render output path from the output node
+    output_node_name = None
     try:
         out_resp = requests.get(f"{config.host}/constructs/current/outputs/{output_uuid}", timeout=20)
         out_resp.raise_for_status()
         out_data = out_resp.json()
         actual_output_path = out_data.get("output", {}).get("outputpath", "")
+        output_node_name = out_data.get("name", "")
         if actual_output_path and os.path.isdir(actual_output_path):
             render_dir = actual_output_path
         else:
             render_dir = export_dir
     except Exception:
         render_dir = export_dir
+
+    # The output node's filespec creates a subfolder named after the output.
+    # Search for frames in that specific subfolder, not the entire render directory.
+    if output_node_name:
+        output_subfolder = os.path.join(render_dir, output_node_name)
+        if os.path.isdir(output_subfolder):
+            render_dir = output_subfolder
 
     # =========================================================================
     # PASS A: Render clean plates (ALL layers disabled for raw source)
@@ -1520,6 +1535,15 @@ def run_option1_pipeline(args):
     # Check if rendered frames already exist from a previous run
     exts = (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".dpx", ".exr")
     existing_frames = recent_render_files([render_dir], 0, exts)
+    _print_step(f"Raw frames found in {render_dir}: {len(existing_frames)}")
+    if existing_frames:
+        _print_step(f"  First: {existing_frames[0]}")
+    # Exclude frames from any AiMatte subdirectory (matte outputs)
+    existing_frames = [f for f in existing_frames
+                       if "\\aimatte\\" not in os.path.normcase(os.path.normpath(f).replace("/", "\\"))]
+    _print_step(f"After excluding AiMatte: {len(existing_frames)} frames")
+    if existing_frames:
+        _print_step(f"  First: {existing_frames[0]}")
     render_source_dir = render_dir
 
     # Check SCRATCH render queue for this output node (queue UUID != output UUID)
