@@ -1483,7 +1483,7 @@ def run_option1_pipeline(args):
     if render_path and os.path.isdir(render_path):
         shot_label = getattr(shot, "name", None) or shot_uuid[:8]
         final_alpha_dir = os.path.join(
-            render_path, "AiMatte", construct_name, f"{slot_idx}_{shot_label}", "Alphas", shot_label, shot_label
+            render_path, "AiMatte", construct_name, f"{slot_idx:03d}_{shot_label}", "Alphas", shot_label, shot_label
         )
     else:
         final_alpha_dir = os.path.join(output_dir, "alpha")
@@ -1504,17 +1504,26 @@ def run_option1_pipeline(args):
         raise RuntimeError(f"Failed to create MatAnyone output node: {e}")
 
     # Read the actual render output path from the output node
+    output_node_name = None
     try:
         out_resp = requests.get(f"{config.host}/constructs/current/outputs/{output_uuid}", timeout=20)
         out_resp.raise_for_status()
         out_data = out_resp.json()
         actual_output_path = out_data.get("output", {}).get("outputpath", "")
+        output_node_name = out_data.get("name", "")
         if actual_output_path and os.path.isdir(actual_output_path):
             render_dir = actual_output_path
         else:
             render_dir = export_dir
     except Exception:
         render_dir = export_dir
+
+    # The output node's filespec creates a subfolder named after the output.
+    # Search for frames in that specific subfolder, not the entire render directory.
+    if output_node_name:
+        output_subfolder = os.path.join(render_dir, output_node_name)
+        if os.path.isdir(output_subfolder):
+            render_dir = output_subfolder
 
     # =========================================================================
     # PASS A: Render clean plates (ALL layers disabled for raw source)
