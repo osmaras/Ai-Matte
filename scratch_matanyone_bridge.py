@@ -60,17 +60,6 @@ def build_argument_parser():
         help=f"Local cache directory for rendered frames (default: {BASE_CACHE_DIR})",
     )
     parser.add_argument(
-        "--mask-layer-name",
-        default="matte,MatAnyone_Mask",
-        help="Preferred mask layer names (comma-separated).",
-    )
-    parser.add_argument(
-        "--mask-layer-fallback",
-        choices=["strict", "first", "top-visible", "top"],
-        default="first",
-        help="Fallback if named mask layer is not found.",
-    )
-    parser.add_argument(
         "--max-min-side",
         type=int,
         default=1080,
@@ -225,6 +214,64 @@ def ensure_current_output(projects_api):
     output_name = getattr(created_output, "name", "MatAnyone_Output")
     _print_step(f"Created output node [{output_name}] UUID: {output_uuid}")
     return output_uuid
+
+
+def create_matanyone_output(config, projects_api, shot_uuid, shot_length, shot_name):
+    """Create or reuse a dedicated output node for MatAnyone matte extraction.
+
+    If a MatAnyone output node already exists from a previous run, reuses it.
+    Otherwise creates a new one via POST /constructs/{construct_uuid}/outputs/new.
+    Output goes into the project's media folder with RGBA TIFF format.
+
+    Returns (output_uuid, output_path).
+    """
+    # Get project media path
+    proj = projects_api.get_projects_current()
+    media_path = None
+    try:
+        pp = proj.project_paths if hasattr(proj, "project_paths") else (proj.get("project_paths") if isinstance(proj, dict) else {})
+        if hasattr(pp, "media_path"):
+            media_path = pp.media_path
+        elif isinstance(pp, dict):
+            media_path = pp.get("media_path")
+    except Exception:
+        pass
+    if not media_path:
+        raise RuntimeError("Could not determine SCRATCH project media path. "
+                           "Ensure a project is loaded and has a media path configured.")
+
+    shot_label = shot_name or shot_uuid[:8]
+    output_dir = os.path.join(media_path, "MatAnyone", shot_uuid[:8], "source_frames").replace("\\", "/")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Check for existing MatAnyone output node and reuse it
+    try:
+        existing = extract_output_nodes(projects_api.get_construct_current_outputs(level="ALL"))
+        for node in existing:
+            node_name = str(getattr(node, "name", "") or "")
+            node_uuid = str(getattr(node, "uuid", "") or "")
+            if node_name.startswith("MatAnyone_") and node_uuid:
+                _print_step(f"Reusing existing output node [{node_name}] UUID: {node_uuid}")
+                return node_uuid, output_dir
+    except Exception as e:
+        _print_step(f"Output scan failed (non-fatal): {e}")
+
+    # No existing node found — create via CC endpoint with type_uuid
+    _print_step(f"Creating output node for shot {shot_label}")
+    endpoint = f"{config.host}/constructs/current/outputs/new"
+    body = {
+        "name": f"MatAnyone_{shot_label}",
+        "type_uuid": "00000000-0000-0000-0000-000000000004",
+    }
+    resp = requests.post(endpoint, json=body, timeout=20)
+    resp.raise_for_status()
+    result = resp.json()
+    out_uuid = result.get("uuid") if isinstance(result, dict) else getattr(result, "uuid", None)
+    if not out_uuid:
+        raise RuntimeError("SCRATCH created the output node but did not return a UUID.")
+    _print_step(f"Created output node [MatAnyone_{shot_label}] UUID: {out_uuid}")
+    _print_step(f"  Output path: {output_dir}")
+    return out_uuid, output_dir
 
 
 def configure_current_output(config, output_uuid, output_path, single_frame=False):
@@ -672,14 +719,25 @@ def _resize_preserving_aspect(image, target_min_side):
 
 def _prepare_batch_input(batch_frames, batch_input_dir, target_min_side):
     original_sizes = {}
+    target_size = None  # computed once from first frame, applied to all
     for frame_path in batch_frames:
         base_name = os.path.basename(frame_path)
         destination = os.path.join(batch_input_dir, base_name)
         with Image.open(frame_path) as src:
             rgb = src.convert("RGB")
-            resized, original_size = _resize_preserving_aspect(rgb, target_min_side)
-            original_sizes[base_name] = original_size
-            resized.save(destination)
+            original_sizes[base_name] = rgb.size
+            if target_size is None:
+                # Compute target size from first frame
+                w, h = rgb.size
+                current_min = min(w, h)
+                if target_min_side > 0 and current_min > target_min_side:
+                    scale = float(target_min_side) / float(current_min)
+                    target_size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+                else:
+                    target_size = (w, h)
+            if rgb.size != target_size:
+                rgb = rgb.resize(target_size, Image.BILINEAR)
+            rgb.save(destination)
     return original_sizes
 
 
@@ -1406,66 +1464,103 @@ def run_option1_pipeline(args):
     os.makedirs(final_alpha_dir, exist_ok=True)
     os.makedirs(mask_render_dir, exist_ok=True)
 
-    _print_step("Resolving construct output node")
+    _print_step("Creating dedicated MatAnyone output node in project media folder")
     try:
-        output_uuid = ensure_current_output(projects_api)
+        output_uuid, export_dir = create_matanyone_output(
+            config, projects_api, shot_uuid,
+            int(getattr(shot, "length", 0) or 0),
+            getattr(shot, "name", None) or shot_uuid[:8],
+        )
     except Exception as e:
-        raise RuntimeError(f"Failed to resolve/create a construct output node: {e}")
+        raise RuntimeError(f"Failed to create MatAnyone output node: {e}")
+
+    # Read the actual render output path from the output node
+    try:
+        out_resp = requests.get(f"{config.host}/constructs/current/outputs/{output_uuid}", timeout=20)
+        out_resp.raise_for_status()
+        out_data = out_resp.json()
+        actual_output_path = out_data.get("output", {}).get("outputpath", "")
+        if actual_output_path and os.path.isdir(actual_output_path):
+            render_dir = actual_output_path
+        else:
+            render_dir = export_dir
+    except Exception:
+        render_dir = export_dir
 
     # =========================================================================
     # PASS A: Render clean plates (ALL layers disabled for raw source)
     # =========================================================================
     layers = _get_shot_layers(projects_api, shot_uuid)
-    target_layer_idx = _pick_mask_layer(layers, args.mask_layer_name, args.mask_layer_fallback)
-    if target_layer_idx is None:
-        available_names = [str(getattr(layer, "name", "")) for layer in layers]
-        raise RuntimeError(
-            f"Could not resolve mask layer names '{args.mask_layer_name}' with fallback='{args.mask_layer_fallback}'. "
-            f"Available layers: {available_names}"
-        )
 
     expected_plate_count = int(getattr(shot, "length", 0) or 0)
-    if expected_plate_count > 0:
-        _print_step(f"PASS A: rendering clean plates 1/{expected_plate_count}..{expected_plate_count}/{expected_plate_count}")
-    else:
-        _print_step("PASS A: rendering clean plate sequence with ALL layers disabled")
+
+    # Check if rendered frames already exist from a previous run
+    exts = (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".dpx", ".exr")
+    existing_frames = recent_render_files([render_dir], 0, exts)
+    render_source_dir = render_dir
+
+    # Check SCRATCH render queue for this output node (queue UUID != output UUID)
+    output_rendered = False
     try:
-        # Disable ALL layers so the clean plate is the raw source footage
-        layer_states_before_pass_a = _save_layer_states(layers)
-        for idx in range(len(layers)):
-            try:
-                _set_layer_active(config, shot_uuid, idx, False)
-            except Exception:
-                pass
-        _print_step(f"Disabled all {len(layers)} layers for clean plate render")
+        queue_list_resp = requests.get(f"{config.host}/application/render", timeout=10)
+        if queue_list_resp.status_code == 200:
+            queue_items = queue_list_resp.json()
+            if isinstance(queue_items, list):
+                for item in queue_items:
+                    item_name = str(item.get("name", ""))
+                    item_status = str(item.get("status", "")).lower()
+                    if item_name.startswith("MatAnyone_") and item_status in ("finished", "complete"):
+                        output_rendered = True
+                        _print_step(f"Output render found in queue: [{item_name}] status={item_status}")
+                        break
+    except Exception:
+        pass
 
-        configure_current_output(config, output_uuid, export_dir, single_frame=False)
-        queue_item, render_started_at = _render_output_pass(
-            app_api,
-            output_uuid,
-            expected_min_files=max(1, expected_plate_count),
-        )
-        render_source_dir = _render_item_path(queue_item) or export_dir
-    except Exception as e:
-        raise RuntimeError(f"Failed during Pass A clean plate render: {e}")
-    finally:
-        # Restore all layers to their original states
-        _restore_all_layers(config, shot_uuid, layer_states_before_pass_a)
-        _print_step("Restored all layer states after clean plate render")
+    if output_rendered:
+        if expected_plate_count > 0:
+            all_frames = existing_frames[:expected_plate_count]
+        else:
+            all_frames = existing_frames
+        _print_step(f"PASS A skipped: output rendered, {len(all_frames)} frames in {render_dir}")
+    else:
+        if expected_plate_count > 0:
+            _print_step(f"PASS A: rendering clean plates 1/{expected_plate_count}..{expected_plate_count}/{expected_plate_count}")
+        else:
+            _print_step("PASS A: rendering clean plate sequence with ALL layers disabled")
+        try:
+            # Disable ALL layers so the clean plate is the raw source footage
+            layer_states_before_pass_a = _save_layer_states(layers)
+            for idx in range(len(layers)):
+                try:
+                    _set_layer_active(config, shot_uuid, idx, False)
+                except Exception:
+                    pass
+            _print_step(f"Disabled all {len(layers)} layers for clean plate render")
 
-    # ── Collect clean plate frames (needed for both the SAM2 editor and MatAnyone) ──
-    _print_step("Collecting rendered clean plate frames")
-    all_frames = recent_render_files(
-        [render_source_dir, export_dir],
-        render_started_at,
-        (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".dpx"),
-    )
-    if not all_frames:
+            configure_current_output(config, output_uuid, export_dir, single_frame=False)
+            queue_item, render_started_at = _render_output_pass(
+                app_api,
+                output_uuid,
+                expected_min_files=max(1, expected_plate_count),
+            )
+            render_source_dir = _render_item_path(queue_item) or export_dir
+        except Exception as e:
+            raise RuntimeError(f"Failed during clean plate render: {e}")
+        finally:
+            # Restore all layers to their original states
+            _restore_all_layers(config, shot_uuid, layer_states_before_pass_a)
+            _print_step("Restored all layer states after clean plate render")
+
+        # ── Collect rendered frames ──
+        _print_step("Collecting rendered clean plate frames")
         all_frames = recent_render_files(
-            [render_source_dir, export_dir],
-            0,
-            (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".dpx"),
+            [render_source_dir, export_dir], render_started_at, exts,
         )
+        if not all_frames:
+            all_frames = recent_render_files(
+                [render_source_dir, export_dir], 0, exts,
+            )
+
     total_frames = len(all_frames)
     if total_frames == 0:
         raise RuntimeError(f"No clean plate frames found in: {export_dir}")
