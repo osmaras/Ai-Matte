@@ -1483,7 +1483,7 @@ def run_option1_pipeline(args):
     if render_path and os.path.isdir(render_path):
         shot_label = getattr(shot, "name", None) or shot_uuid[:8]
         final_alpha_dir = os.path.join(
-            render_path, "AiMatte", construct_name, f"{slot_idx:03d}_{shot_label}", "Alphas", shot_label, shot_label
+            render_path, "AiMatte", construct_name, f"{slot_idx:03d}_{shot_label}", "Alphas", shot_label
         )
     else:
         final_alpha_dir = os.path.join(output_dir, "alpha")
