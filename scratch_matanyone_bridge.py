@@ -1467,18 +1467,24 @@ def run_option1_pipeline(args):
     except Exception:
         render_path = None
 
-    # Get construct name for folder structure
+    # Get construct name and slot index for folder structure
     try:
         construct_data = projects_api.get_constructs_current(level="ALL")
         construct_name = getattr(construct_data, "name", None) or "Unknown"
     except Exception:
         construct_name = "Unknown"
+    try:
+        selected = projects_api.get_construct_current_selected_shots(level="ALL")
+        selections = _extract_selected_entries(selected)
+        slot_idx = int(getattr(selections[0], "slot_idx", 0) or 0) if selections else 0
+    except Exception:
+        slot_idx = 0
 
     if render_path and os.path.isdir(render_path):
         shot_label = getattr(shot, "name", None) or shot_uuid[:8]
         final_alpha_dir = os.path.join(
-            render_path, "AiMatte", construct_name, shot_label, "Alphas", shot_label, shot_label
-        ).replace("\\", "/")
+            render_path, "AiMatte", construct_name, f"{slot_idx}_{shot_label}", "Alphas", shot_label, shot_label
+        )
     else:
         final_alpha_dir = os.path.join(output_dir, "alpha")
     
@@ -1520,6 +1526,15 @@ def run_option1_pipeline(args):
     # Check if rendered frames already exist from a previous run
     exts = (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".dpx", ".exr")
     existing_frames = recent_render_files([render_dir], 0, exts)
+    _print_step(f"Raw frames found in {render_dir}: {len(existing_frames)}")
+    if existing_frames:
+        _print_step(f"  First: {existing_frames[0]}")
+    # Exclude frames from any AiMatte subdirectory (matte outputs)
+    existing_frames = [f for f in existing_frames
+                       if "\\aimatte\\" not in os.path.normcase(os.path.normpath(f).replace("/", "\\"))]
+    _print_step(f"After excluding AiMatte: {len(existing_frames)} frames")
+    if existing_frames:
+        _print_step(f"  First: {existing_frames[0]}")
     render_source_dir = render_dir
 
     # Check SCRATCH render queue for this output node (queue UUID != output UUID)
