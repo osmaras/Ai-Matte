@@ -1456,8 +1456,31 @@ def run_option1_pipeline(args):
     workspace_dir = os.path.join(args.cache_dir, shot_uuid)
     export_dir = os.path.join(workspace_dir, "source_frames")
     output_dir = os.path.join(workspace_dir, "results")
-    final_alpha_dir = os.path.join(output_dir, "alpha")
     mask_render_dir = os.path.join(workspace_dir, "mask_render")
+
+    # Final matte output goes to SCRATCH project render folder
+    try:
+        proj_paths = projects_api.get_projects_current()
+        render_path = getattr(proj_paths, "project_paths", None)
+        if render_path:
+            render_path = getattr(render_path, "render_path", None)
+    except Exception:
+        render_path = None
+
+    # Get construct name for folder structure
+    try:
+        construct_data = projects_api.get_constructs_current(level="ALL")
+        construct_name = getattr(construct_data, "name", None) or "Unknown"
+    except Exception:
+        construct_name = "Unknown"
+
+    if render_path and os.path.isdir(render_path):
+        shot_label = getattr(shot, "name", None) or shot_uuid[:8]
+        final_alpha_dir = os.path.join(
+            render_path, "AiMatte", construct_name, shot_label, "Alphas", shot_label, shot_label
+        ).replace("\\", "/")
+    else:
+        final_alpha_dir = os.path.join(output_dir, "alpha")
     
     os.makedirs(export_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
